@@ -31,13 +31,14 @@ GRACE_PERIOD = WAIT_TIMEOUT + 30 # זמן חסד לסנכרון שיחות מנ�
 # ============================================================
 
 
-# ==================== הגדרת מערכת לוגים ====================
+# ==================== הגדרת מערכת לוגים מסודרת ====================
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "system.log")
 
+# פורמט נקי וברור: [זמן] [רמת לוג] הודעה
 log_formatter = logging.Formatter(
-    fmt="[%(asctime)s] [%(levelname)-7s] [%(name)s] %(message)s",
+    fmt="[%(asctime)s] [%(levelname)-7s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
@@ -120,7 +121,7 @@ class SheetDataManager:
             async with httpx.AsyncClient() as client:
                 res = await client.get(self.csv_export_url, timeout=10.0, follow_redirects=True)
                 if res.status_code != 200:
-                    log_sheets.error(f"שגיאה בהורדת הגיליון: קוד סטטוס HTTP {res.status_code}")
+                    log_sheets.error(f"שגיאה בהורדת הגיליון (סטטוס HTTP: {res.status_code})")
                     return
 
                 content = res.content.decode('utf-8-sig')
@@ -160,7 +161,7 @@ class SheetDataManager:
                 self.agent_to_depts = new_agent_to_depts
 
                 total_agents = sum(len(v) for v in self.dept_general_agents.values())
-                log_sheets.info(f"הסנכרון הושלם: {len(self.personal_lines)} מנהלים, {total_agents} נציגים ב-{len(self.dept_general_agents)} מחלקות.")
+                log_sheets.info(f"סנכרון Sheets הושלם בהצלחה: {len(self.personal_lines)} מנהלים, {total_agents} נציגים ב-{len(self.dept_general_agents)} מחלקות.")
         except Exception as e:
             log_sheets.exception(f"תקלה בקריאת קובץ השיטס: {e}")
 
@@ -192,7 +193,7 @@ class SystemManager:
             task = self.tzintuk_tasks.pop(target_key, None)
             if task and not task.done():
                 task.cancel()
-                log_tzintuk.info(f"התור התרוקן לחלוטין - משימת הצינתוקים של {target_key} בוטלה מיד.")
+                log_tzintuk.info(f"[צינתוקים] התור התרוקן - הצינתוקים של {target_key} נעצרו.")
 
 
 manager = SystemManager()
@@ -214,7 +215,7 @@ async def yemot_api_request(endpoint: str, params: dict = None):
             res = await client.get(url, params=p, timeout=10.0)
             return res.json()
     except Exception as e:
-        log_call.error(f"שגיאת תקשורת מול API ימות המשיח ({endpoint}): {e}")
+        log_call.error(f"שגיאת תקשורת מול ימות המשיח ({endpoint}): {e}")
         return None
 
 
@@ -240,31 +241,26 @@ async def is_agent_connected(phone: str) -> bool:
 async def send_tzintuk(phone: str):
     clean_phone = normalize_phone(phone)
     if len(clean_phone) not in [9, 10]:
-        log_tzintuk.error(f"מספר טלפון שגוי ({clean_phone}). הצינתוק בוטל.")
+        log_tzintuk.error(f"[צינתוק] מספר טלפון שגוי ({clean_phone}). הצינתוק בוטל.")
         return
 
     target_list = f"tzl:{clean_phone}"
-    log_tzintuk.info(f"שולח פקודת RunTzintuk לימות המשיח (יעד: {target_list})...")
-
     result = await yemot_api_request("RunTzintuk", params={
         "phones": target_list,
         "TzintukTimeOut": 10,
         "sayInfoOnAnswer": "true"
     })
 
-    if result:
-        status = result.get("responseStatus")
-        if status == "OK":
-            log_tzintuk.info(f"הצינתוק לרשימה {target_list} נשלח בהצלחה! תגובת שרת: {result}")
-        else:
-            log_tzintuk.error(f"ימות המשיח דחתה את הצינתוק לרשימה {target_list}! תגובת שרת: {result}")
+    if result and result.get("responseStatus") == "OK":
+        log_tzintuk.info(f"[צינתוק] צינתוק נשלח בהצלחה לטלפון: {clean_phone}")
     else:
-        log_tzintuk.error(f"לא התקבלה תשובה משרתי ימות המשיח עבור צינתוק ל-{target_list}.")
+        error_msg = result.get("message") if result else "אין תגובה מהשרת"
+        log_tzintuk.warning(f"[צינתוק] שליחת צינתוק ל-{clean_phone} נכשלה ({error_msg})")
 
 
 async def run_tzintuk_loop(target_key: str, get_phones_func):
     """לולאת צינתוקים מדורגת לפי בדיקת מענה של הנציג"""
-    log_tzintuk.info(f"לולאת צינתוקים הופעלה עבור יעד: {target_key}")
+    log_tzintuk.info(f"[צינתוקים] לולאת צינתוקים הופעלה עבור יעד: {target_key}")
     try:
         while True:
             if not manager.has_waiting_for_target(target_key):
@@ -275,47 +271,45 @@ async def run_tzintuk_loop(target_key: str, get_phones_func):
                 phones = [phones]
 
             if not phones:
-                log_tzintuk.warning(f"לא נמצאו מספרי טלפון להפצת צינתוק עבור {target_key}.")
+                log_tzintuk.warning(f"[צינתוקים] לא נמצאו מספרי טלפון עבור {target_key}.")
                 await asyncio.sleep(15)
                 continue
 
             for phone in phones:
                 if not manager.has_waiting_for_target(target_key):
-                    log_tzintuk.info(f"התור התרוקן. עוצר סבב צינתוקים עבור {target_key}.")
                     return
 
-                # 1. שליחת הצינתוק (מצלצל עד 10 שניות)
+                # 1. שליחת הצינתוק
                 await send_tzintuk(phone)
 
-                # 2. בדיקה האם הנציג ענה לצינתוק ונכנס לקו (דגימה לאורך 10 שניות)
+                # 2. בדיקה האם הנציג ענה לצינתוק ונכנס לקו (עד 10 שניות)
                 agent_entered = False
                 for _ in range(10):
                     await asyncio.sleep(1)
                     if not manager.has_waiting_for_target(target_key):
-                        log_tzintuk.info(f"התור התרוקן/נענה. מפסיק בדיקת נציג {phone}.")
                         return
 
                     if await is_agent_connected(phone):
                         agent_entered = True
-                        log_tzintuk.info(f"נציג {phone} ענה לצינתוק ונכנס למערכת.")
+                        log_tzintuk.info(f"[צינתוקים] נציג {phone} ענה לצינתוק ונכנס למערכת.")
                         break
 
-                # 3. אם הנציג נכנס לקו - ממתינים 10 שניות לבדוק האם הוא מושך את השיחה
+                # 3. אם הנציג נכנס לקו - ממתינים עד 10 שניות לבדוק האם הוא מושך את השיחה
                 if agent_entered:
-                    log_tzintuk.info(f"ממתין 10 שניות לנציג {phone} שיקבל את השיחה בשלוחה 20...")
+                    log_tzintuk.info(f"[צינתוקים] ממתין לנציג {phone} שיקבל את השיחה בשלוחה 20...")
                     for _ in range(10):
                         await asyncio.sleep(1)
                         if not manager.has_waiting_for_target(target_key):
-                            log_tzintuk.info(f"השיחה נענתה בהצלחה. עוצר צינתוקים לשיחה זו.")
+                            log_tzintuk.info(f"[צינתוקים] השיחה נענתה בהצלחה. סבב הצינתוקים הסתיים.")
                             return
-                    log_tzintuk.warning(f"נציג {phone} נכנס לקו אך לא לקח את השיחה תוך 10 שניות. עובר לנציג הבא.")
+                    log_tzintuk.warning(f"[צינתוקים] נציג {phone} לא לקח את השיחה תוך 10 שניות. עובר לנציג הבא.")
 
             await asyncio.sleep(10)
 
     except asyncio.CancelledError:
-        log_tzintuk.info(f"משימת הצינתוקים של {target_key} נעצרה ובוטלה מיידית.")
+        log_tzintuk.info(f"[צינתוקים] משימת הצינתוקים של {target_key} נעצרה.")
     except Exception as e:
-        log_tzintuk.exception(f"תקלה בלולאת הצינתוקים ({target_key}): {e}")
+        log_tzintuk.exception(f"[צינתוקים] תקלה בלולאת הצינתוקים ({target_key}): {e}")
     finally:
         manager.tzintuk_tasks.pop(target_key, None)
 
@@ -352,7 +346,7 @@ async def background_cleanup_loop():
                                 
                         for call in to_remove:
                             cid = call.call_id
-                            log_sync.info(f"שיחה {cid} נותקה ללא דיווח (עבר זמן החסד). מנקה מהתור.")
+                            log_sync.info(f"[סנכרון] שיחה {cid} נותקה ללא דיווח (Timeout). הוסרה מהתור.")
                             manager.waiting_calls.pop(cid, None)
                             manager.waiting_events.pop(cid, None)
                             manager.waiting_destinations.pop(cid, None)
@@ -361,7 +355,7 @@ async def background_cleanup_loop():
                             t_key = f"personal_{call.target_manager_phone}" if call.queue_type == "personal" else f"general_{call.dept_id}"
                             manager.cancel_tzintuk_if_empty(t_key)
         except Exception as e:
-            log_sync.exception(f"שגיאה בלולאת הניקוי: {e}")
+            log_sync.exception(f"[סנכרון] שגיאה בלולאת הניקוי: {e}")
         await asyncio.sleep(15)
 
 
@@ -412,7 +406,6 @@ async def yemot_router(request: Request):
 
     if not call_id and (caller_phone or api_extension):
         call_id = f"gen_{caller_phone or 'anon'}_{int(time.time() * 1000)}"
-        log_call.warning(f"נוצר מזהה חלופי: {call_id}")
 
     if call_id:
         manager.last_seen[call_id] = time.time()
@@ -426,7 +419,8 @@ async def yemot_router(request: Request):
             manager.waiting_destinations.pop(call_id, None)
             manager.waiting_events.pop(call_id, None)
 
-            log_call.info(f"התקבל דיווח ניתוק (hangup=yes) עבור שיחה {call_id}.")
+            caller_desc = f"({removed_call.phone})" if removed_call else ""
+            log_call.info(f"[ניתוק] שיחה {call_id} {caller_desc} נותקה (hangup=yes).")
 
             if removed_call:
                 t_key = f"personal_{removed_call.target_manager_phone}" if removed_call.queue_type == "personal" else f"general_{removed_call.dept_id}"
@@ -435,7 +429,7 @@ async def yemot_router(request: Request):
         return Response("noop=yes", media_type="text/plain; charset=utf-8")
 
     if not call_id:
-        log_call.warning(f"בקשה חסרת מזהה שיחה. פרמטרים: {params}")
+        log_call.warning(f"[בקשה חריגה] התקבלה פנייה ללא מזהה שיחה.")
         return Response("id_list_message=t-מזהה שיחה חסר&go_to_folder=..", media_type="text/plain; charset=utf-8")
 
     # 2. Race Condition
@@ -443,7 +437,7 @@ async def yemot_router(request: Request):
         destination = manager.waiting_destinations.get(call_id)
         if call_id in manager.waiting_events:
             manager.waiting_events[call_id].set()
-        log_call.info(f"[Race Condition] מאזין {call_id} כבר הוקצה לשלוחה {destination}. מעביר מיידית!")
+        log_call.info(f"[Race Condition] מאזין {caller_phone} כבר שודך לחדר. מעביר מיידית ל-{destination}")
         return Response(f"id_list_message=t-מעביר אותך לנציג&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
@@ -451,7 +445,7 @@ async def yemot_router(request: Request):
     # ==============================================================
     agent_full_ext = build_path("20")
     if api_extension == agent_full_ext or api_extension == "20":
-        log_agent.info(f"נציג/מנהל התחבר לשלוחה 20! מספר: {caller_phone}")
+        log_agent.info(f"[כניסת נציג] נציג/מנהל התחבר לשלוחה 20 (טלפון: {caller_phone})")
         async with manager.lock:
             selected_call: Optional[QueuedCall] = None
 
@@ -463,7 +457,7 @@ async def yemot_router(request: Request):
             if personal_calls:
                 personal_calls.sort(key=lambda x: x.entry_time)
                 selected_call = personal_calls[0]
-                log_agent.info(f"מנהל זוהה! מושך שיחה אישית ראשונה (מזהה: {selected_call.call_id}).")
+                log_agent.info(f"[שיחה אישית] מנהל זוהה! מושך שיחה אישית ראשונה ממאזין {selected_call.phone}.")
 
             # עדיפות 2: שיחה כללית במחלקות שהנציג מורשה בהן
             if not selected_call:
@@ -475,14 +469,13 @@ async def yemot_router(request: Request):
                 if general_calls:
                     general_calls.sort(key=lambda x: x.entry_time)
                     selected_call = general_calls[0]
-                    log_agent.info(f"נציג זוהה! מושך שיחה כללית במחלקה {selected_call.dept_id} (מזהה: {selected_call.call_id}).")
+                    log_agent.info(f"[שיחה כללית] נציג זוהה! מושך שיחה ממחלקה {selected_call.dept_id} (מאזין: {selected_call.phone}).")
 
-            # שידוך לחדר פנוי (ניווט ישיר לחדר בשלוחה הראשית)
+            # שידוך לחדר פנוי
             if selected_call:
                 active_calls = await get_active_calls()
                 free_room = find_free_room(active_calls, selected_call.dept_id)
 
-                # הניווט מתחיל בסלאש ומפנה ישירות לראשית: /rooms/{dept}/{room}/
                 agent_dest = f"/{ROOMS_ROOT_FOLDER}/{selected_call.dept_id}/{free_room}/2"
                 listener_dest = f"/{ROOMS_ROOT_FOLDER}/{selected_call.dept_id}/{free_room}/1"
 
@@ -495,11 +488,11 @@ async def yemot_router(request: Request):
                 t_key = f"personal_{selected_call.target_manager_phone}" if selected_call.queue_type == "personal" else f"general_{selected_call.dept_id}"
                 manager.cancel_tzintuk_if_empty(t_key)
 
-                log_agent.info(f"שידוך הצליח! חדר: {free_room}. נציג מועבר ל: {agent_dest}, מאזין מועבר ל: {listener_dest}")
-                msg = "לשיחה אישית" if selected_call.queue_type == "personal" else "לתור הממתינים"
-                return Response(f"id_list_message=t-מעביר אותך {msg} בחדר {free_room}&go_to_folder={agent_dest}", media_type="text/plain; charset=utf-8")
+                call_type_desc = "לשיחה אישית" if selected_call.queue_type == "personal" else "לתור הממתינים"
+                log_agent.info(f"[שידוך מוצלח] חדר: {free_room} | נציג ({caller_phone}) ⬅️ {agent_dest} | מאזין ({selected_call.phone}) ⬅️ {listener_dest}")
+                return Response(f"id_list_message=t-מעביר אותך {call_type_desc} בחדר {free_room}&go_to_folder={agent_dest}", media_type="text/plain; charset=utf-8")
             else:
-                log_agent.info(f"נציג {caller_phone} נכנס, אך אין שיחות ממתינות עבורו.")
+                log_agent.info(f"[נציג ממתין] נציג {caller_phone} נכנס לשלוחה 20, אך אין שיחות ממתינות עבורו.")
                 return Response("id_list_message=t-אין שיחות ממתינות עבורך כעת&go_to_folder=..", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
@@ -510,7 +503,7 @@ async def yemot_router(request: Request):
         sub_ext = sub_ext[len(BASE_FOLDER) + 1:]
 
     if len(manager.waiting_calls) == 0:
-        log_queue.info("נכנס מאזין חדש לתור ריק - מרענן הגדרות מגוגל שיטס...")
+        log_queue.info("מאזין חדש נכנס לתור ריק - מרענן הגדרות מ-Google Sheets...")
         await sheet_data.reload_from_sheets()
 
     queue_type = None
@@ -530,9 +523,10 @@ async def yemot_router(request: Request):
         target_title = f"לתור הכללי במחלקה {dept_id}"
 
     if not queue_type:
-        log_call.warning(f"שלוחה לא מזוהה בשיטס: {api_extension} (תת-שלוחה: {sub_ext})")
+        log_call.warning(f"[שלוחה חריגה] שלוחה {api_extension} לא מוגדרת בשיטס (טלפון מאזין: {caller_phone})")
         return Response("id_list_message=t-שלוחה לא מוגדרת בשיטס&go_to_folder=..", media_type="text/plain; charset=utf-8")
 
+    # כניסה ראשונית של המאזין לתור
     async with manager.lock:
         if call_id not in manager.waiting_calls:
             q_call = QueuedCall(
@@ -558,9 +552,10 @@ async def yemot_router(request: Request):
             if t_key not in manager.tzintuk_tasks or manager.tzintuk_tasks[t_key].done():
                 manager.tzintuk_tasks[t_key] = asyncio.create_task(run_tzintuk_loop(t_key, phone_func))
 
-            log_queue.info(f"מאזין חדש ({caller_phone}, מזהה: {call_id}) נכנס {target_title}. מיקום בתור: {pos}")
+            log_queue.info(f"[כניסת מאזין] מאזין {caller_phone} נכנס {target_title} (מיקום בתור: {pos})")
             return Response(f"id_list_message=t-מיקומך בתור {target_title} הוא {pos}&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
 
+    # כניסה חוזרת – המתנה רציפה
     event = asyncio.Event()
     manager.waiting_events[call_id] = event
 
@@ -568,7 +563,7 @@ async def yemot_router(request: Request):
         await asyncio.wait_for(event.wait(), timeout=float(WAIT_TIMEOUT))
         default_room = f"/{ROOMS_ROOT_FOLDER}/{dept_id}/1/1"
         destination = manager.waiting_destinations.get(call_id, default_room)
-        log_queue.info(f"מאזין {call_id} שוחרר מההמתנה! מעביר ליעד בראשי: {destination}")
+        log_queue.info(f"[שחרור מאזין] מאזין {caller_phone} שוחרר מההמתנה והועבר לנציג (יעד: {destination})")
         return Response(f"id_list_message=t-מעביר אותך לנציג&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
     except asyncio.TimeoutError:
         async with manager.lock:
