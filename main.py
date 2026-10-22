@@ -25,7 +25,7 @@ BASE_FOLDER = "00"
 ROOMS_ROOT_FOLDER = "rooms"
 
 # נתיב קובץ הלוג בתוך מערכת ימות המשיח:
-YEMOT_LOG_FILE_PATH = "ivr2:00/30/Log.ini"
+YEMOT_LOG_FILE_PATH = f"ivr2:{BASE_FOLDER}/30/Log.ini" if BASE_FOLDER else "ivr2:30/Log.ini"
 
 # קישור השיתוף לגיליון גוגל שיטס:
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lSf6FK2wjCMwu-oZzrBsWlvPw5wXQ2RK6RJnV2h1GjM/edit?usp=sharing"
@@ -205,13 +205,12 @@ class SystemManager:
         self.waiting_events: Dict[str, asyncio.Event] = {}
         self.waiting_destinations: Dict[str, str] = {}
         self.transferred_calls: Dict[str, str] = {}
-        self.busy_agents: Set[str] = set()             # מעקב נציגים פעילים כעת בשיחה
-        self.occupied_rooms: Dict[str, Set[int]] = {}  # מעקב חדרים תפוסים
+        self.busy_agents: Set[str] = set()
+        self.occupied_rooms: Dict[str, Set[int]] = {}
         self.last_seen: Dict[str, float] = {}
         self.tzintuk_tasks: Dict[str, asyncio.Task] = {}
         self.call_history: Dict[str, dict] = {}
         self.last_call_by_phone: Dict[str, dict] = {}
-        self.recording_counter = 0
         self.lock = asyncio.Lock()
 
     def has_waiting_for_target(self, target_key: str) -> bool:
@@ -234,7 +233,7 @@ manager = SystemManager()
 
 
 # ==================== תקשורת API מול ימות המשיח ====================
-async def yemot_api_request(endpoint: str, params: dict = None, method: str = "GET", data: dict = None, timeout: float = 3.0):
+async def yemot_api_request(endpoint: str, params: dict = None, method: str = "GET", data: dict = None, timeout: float = 4.0):
     if not YEMOT_API_TOKEN or YEMOT_API_TOKEN == "your_actual_token_here":
         root_logger.error("שגיאה: טוקן ה-API לא מוגדר בקוד!")
         return None
@@ -258,19 +257,49 @@ async def yemot_api_request(endpoint: str, params: dict = None, method: str = "G
         return None
 
 
-async def append_to_yemot_log(log_line: str):
-    """רישום שורה ל-00/30/Log.ini בימות המשיח"""
-    res = await yemot_api_request(
-        "AppendTextFile",
-        method="POST",
-        data={
-            "what": YEMOT_LOG_FILE_PATH,
-            "contents": log_line + "\n"
-        },
-        timeout=3.0
-    )
-    if res and res.get("responseStatus") == "OK":
-        root_logger.info(f"נרשם לוג במערכת: {log_line}")
+async def append_to_yemot_log(caller_phone: str, customer_name: str, agent_phone: str, agent_name: str, date_str: str, time_str: str):
+    """
+    רישום שורת לוג במערכת ימות המשיח דרך הפקודות הרשמיות GetTextFile + UploadTextFile.
+    יוצר אוטומטית את הקובץ אם אינו קיים, ומוסיף את השורה בסדר עולה (001.wav, 002.wav...)
+    """
+    try:
+        # 1. קריאת תוכן הקובץ הקיים
+        res_get = await yemot_api_request("GetTextFile", params={"what": YEMOT_LOG_FILE_PATH}, timeout=4.0)
+        current_content = ""
+        line_count = 0
+
+        if res_get and res_get.get("responseStatus") == "OK":
+            current_content = res_get.get("contents", "")
+            lines = [l.strip() for l in current_content.splitlines() if l.strip()]
+            line_count = len(lines)
+
+        # 2. חישוב מספר ההקלטה הבא (001.wav, 002.wav...)
+        next_num = line_count + 1
+        rec_filename = f"{next_num:03d}.wav"
+
+        # 3. יצירת השורה במבנה המבוקש
+        new_entry = f"{rec_filename}={date_str}|{time_str}|{agent_phone}|{agent_name}|{caller_phone}|{customer_name}"
+        
+        updated_content = current_content.rstrip() + ("\n" if current_content.strip() else "") + new_entry + "\n"
+
+        # 4. שמירת הקובץ המעודכן בימות המשיח דרך UploadTextFile
+        res_upload = await yemot_api_request(
+            "UploadTextFile",
+            method="POST",
+            data={
+                "what": YEMOT_LOG_FILE_PATH,
+                "contents": updated_content
+            },
+            timeout=5.0
+        )
+
+        if res_upload and res_upload.get("responseStatus") == "OK":
+            root_logger.info(f"קובץ הלוג {YEMOT_LOG_FILE_PATH} עודכן בהצלחה בימות המשיח: {new_entry}")
+        else:
+            root_logger.warning(f"שגיאה בעדכון קובץ הלוג בימות המשיח: {res_upload}")
+
+    except Exception as e:
+        root_logger.error(f"שגיאה ברישום לוג בימות המשיח: {e}")
 
 
 async def get_active_calls():
@@ -332,7 +361,7 @@ async def run_tzintuk_loop(target_key: str, get_phones_func):
                 if not manager.has_waiting_for_target(target_key):
                     return
 
-                # דילוג על נציג שכבר נמצא בשיחה פעילה (אישית או כללית)
+                # דילוג על נציג שכבר נמצא בשיחה פעילה
                 if await is_agent_connected(phone):
                     agent_name = sheet_data.phone_to_name.get(phone, "")
                     root_logger.info(f"נציג {phone} ({agent_name or 'ללא שם'}) כבר בשיחה פעילה - מדלג עליו בצינתוקים.")
@@ -482,7 +511,6 @@ async def yemot_router(request: Request):
             manager.waiting_destinations.pop(call_id, None)
             manager.waiting_events.pop(call_id, None)
 
-            # שחרור נציג אם ניתק
             if caller_phone in manager.busy_agents:
                 manager.busy_agents.discard(caller_phone)
 
@@ -546,7 +574,6 @@ async def yemot_router(request: Request):
     # ==============================================================
     agent_full_ext = build_path("20")
     if api_extension == agent_full_ext or api_extension == "20":
-        # הנציג זמין לקבלת שיחה
         manager.busy_agents.discard(caller_phone)
         agent_name = sheet_data.phone_to_name.get(caller_phone, "")
         root_logger.info(f"נציג מחובר לשלוחה 20: {caller_phone} ({agent_name or 'ללא שם'})")
@@ -564,7 +591,7 @@ async def yemot_router(request: Request):
                 selected_call = personal_calls[0]
                 root_logger.info(f"מושך שיחה אישית עבור {caller_phone} (מאזין: {selected_call.phone})")
 
-            # עדיפות 2: רק אם אין שום שיחה אישית – מושך שיחה כללית
+            # עדיפות 2: שיחה כללית
             if not selected_call:
                 allowed_depts = sheet_data.agent_to_depts.get(caller_phone, set())
                 general_calls = [
@@ -587,7 +614,7 @@ async def yemot_router(request: Request):
                 manager.waiting_destinations[selected_call.call_id] = listener_dest
                 manager.transferred_calls[selected_call.call_id] = listener_dest
 
-                # סימון החדר והנציג כתפוסים בשיחה פעילה
+                # סימון החדר והנציג כתפוסים
                 manager.busy_agents.add(caller_phone)
                 if selected_call.dept_id not in manager.occupied_rooms:
                     manager.occupied_rooms[selected_call.dept_id] = set()
@@ -596,11 +623,8 @@ async def yemot_router(request: Request):
                 if selected_call.call_id in manager.waiting_events:
                     manager.waiting_events[selected_call.call_id].set()
 
-                # תיעוד השיחה בזיכרון השרת ובקובץ Log.ini
+                # שמירה בזיכרון השרת
                 now_dt = datetime.datetime.now()
-                manager.recording_counter += 1
-                rec_filename = f"{manager.recording_counter:03d}.wav"
-                
                 customer_name = sheet_data.phone_to_name.get(selected_call.phone, "")
                 date_str = now_dt.strftime("%d/%m/%Y")
                 time_str = now_dt.strftime("%H:%M")
@@ -621,17 +645,24 @@ async def yemot_router(request: Request):
                 manager.call_history[selected_call.call_id] = call_record
                 manager.last_call_by_phone[selected_call.phone] = call_record
 
-                log_entry = f"{rec_filename}={date_str}|{time_str}|{caller_phone}|{agent_name}|{selected_call.phone}|{customer_name}"
-                asyncio.create_task(append_to_yemot_log(log_entry))
+                # עדכון קובץ הלוג במערכת ימות המשיח דרך UploadTextFile הרשמי!
+                asyncio.create_task(
+                    append_to_yemot_log(
+                        caller_phone=selected_call.phone,
+                        customer_name=customer_name,
+                        agent_phone=caller_phone,
+                        agent_name=agent_name,
+                        date_str=date_str,
+                        time_str=time_str
+                    )
+                )
 
                 t_key = f"personal_{selected_call.target_manager_phone}" if selected_call.queue_type == "personal" else f"general_{selected_call.dept_id}"
                 manager.cancel_tzintuk_if_empty(t_key)
 
                 root_logger.info(f"שידוך הצליח בחדר {free_room}: נציג {caller_phone} ומאזין {selected_call.phone}")
-                # לנציג נאמר אך ורק: "מעביר אותך לשיחה" ללא שום מספרי חדרים
                 return Response(f"id_list_message=t-מעביר אותך לשיחה.g-{agent_dest}&go_to_folder={agent_dest}", media_type="text/plain; charset=utf-8")
             else:
-                # הנציג סיים שיחה ונשאר על הקו – נשאר בהמתנה בשלוחה 20 עד שייכנס מאזין חדש
                 root_logger.info(f"נציג {caller_phone} ממתין בשלוחה 20 לשיחה הבאה.")
                 return Response(f"id_list_message=t-אין שיחות ממתינות כעת&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
 
@@ -656,7 +687,6 @@ async def yemot_router(request: Request):
         target_manager_phone = p_info.phone
         dept_id = p_info.dept_id
         
-        # ניסוח הודעת מעבר מדויקת:
         if p_info.is_manager:
             transfer_msg = "מעביר אותך לשיחה עם המנהל"
         elif p_info.name:
@@ -712,7 +742,6 @@ async def yemot_router(request: Request):
         fallback_dest = f"/{ROOMS_ROOT_FOLDER}/{dept_id}/1/1"
         destination = manager.waiting_destinations.get(call_id, fallback_dest)
         
-        # השמעת הודעת המעבר המדויקת למאזין והעברה מיידית לחדר
         root_logger.info(f"מאזין {caller_phone} שוחרר מההמתנה ועובר ל-{destination} ({transfer_msg})")
         return Response(f"id_list_message=t-{transfer_msg}.g-{destination}&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
         
