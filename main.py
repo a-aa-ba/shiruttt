@@ -95,10 +95,11 @@ def normalize_phone(phone: str) -> str:
     return clean
 
 
-def format_call_details_message(rec: dict) -> str:
+def format_recording_details_tts(rec: dict) -> str:
     """
-    בונה מחרוזת id_list_message תקינה לחלוטין עבור מנוע ה-TTS של ימות המשיח.
-    מונע שגיאות הקראה: ללא נקודות פנימיות, ללא לוכסנים וללא קינון שגוי.
+    בונה את המשפט המדויק:
+    'בתאריך XXX בשעה XXX שוחח המאזין (שם או טלפון) עם הנציג (שם או טלפון)'
+    בתחביר תקין של מנוע ה-TTS בימות המשיח, ללא שגיאות.
     """
     date_str = rec.get("date_str", "")
     time_str = rec.get("time_str", "")
@@ -108,33 +109,32 @@ def format_call_details_message(rec: dict) -> str:
     customer_phone = rec.get("caller_phone", "")
     is_anon = rec.get("is_anonymous", False)
 
-    # פירוק התאריך והשעה לעברית מדוברת
-    date_parts = date_str.split("/")
-    if len(date_parts) == 3:
-        clean_date = f"{date_parts[0]} לחודש {date_parts[1]}"
-    else:
-        clean_date = date_str.replace("/", " ")
-
+    # פירוק תאריך ושעה לטקסט זורם
+    clean_date = date_str.replace("/", " ")
     clean_time = time_str.replace(":", " ו-")
 
     segments = []
-    segments.append(f"t-פרטי השיחה, תאריך {clean_date}, בשעה {clean_time}")
+    segments.append(f"t-בתאריך {clean_date} בשעה {clean_time}")
 
-    # פרטי הנציג
-    if agent_name:
-        segments.append(f"t-הנציג {agent_name}")
-    elif agent_phone:
-        segments.append("t-הנציג")
-        segments.append(f"d-{agent_phone}")
-
-    # פרטי המאזין
+    # המאזין
     if is_anon:
-        segments.append("t-המאזין שיחה אנונימית מספר חסוי")
+        segments.append("t-שוחח המאזין שיחה אנונימית מספר חסוי")
     elif customer_name:
-        segments.append(f"t-המאזין {customer_name}")
+        segments.append(f"t-שוחח המאזין {customer_name}")
     elif customer_phone:
-        segments.append("t-המאזין")
+        segments.append("t-שוחח המאזין")
         segments.append(f"d-{customer_phone}")
+    else:
+        segments.append("t-שוחח המאזין")
+
+    # הנציג
+    if agent_name:
+        segments.append(f"t-עם הנציג {agent_name}")
+    elif agent_phone:
+        segments.append("t-עם הנציג")
+        segments.append(f"d-{agent_phone}")
+    else:
+        segments.append("t-עם הנציג")
 
     return ".".join(segments)
 
@@ -163,7 +163,6 @@ class ManagerLineInfo:
 
 
 class SheetDataManager:
-    """ניהול משיכת נתונים מ-Google Sheets: מחלקות (1-3) ולקוחות (טאב 4)"""
     def __init__(self, sheet_url: str):
         self.sheet_url = sheet_url
         self.spreadsheet_id = self._extract_sheet_id(sheet_url)
@@ -194,7 +193,7 @@ class SheetDataManager:
         new_customer_contacts = {}
 
         async with httpx.AsyncClient() as client:
-            # 1. טעינת מחלקות 1 עד 3
+            # טעינת מחלקות 1-3
             for tab_name in DEPARTMENT_TABS:
                 clean_tab_name = tab_name.strip()
                 dept_id = DEPT_NAME_TO_ID.get(clean_tab_name)
@@ -264,7 +263,7 @@ class SheetDataManager:
                 except Exception as e:
                     root_logger.warning(f"שגיאה בקריאת טאב מחלקה {tab_name}: {e}")
 
-            # 2. טעינת טאב 4: רשימת לקוחות
+            # טעינת טאב 4 לקוחות
             contacts_tabs_to_try = [CONTACTS_TAB_NAME, "4", "לקוחות", "אנשי קשר"]
             for c_tab in contacts_tabs_to_try:
                 c_tab_encoded = urllib.parse.quote(c_tab)
@@ -281,10 +280,8 @@ class SheetDataManager:
                                 if not r or not any(r):
                                     continue
                                 row_dict = {headers[i]: r[i].strip() for i in range(min(len(headers), len(r)))}
-                                
                                 c_name = row_dict.get("שם", "") or row_dict.get("שם לקוח", "")
                                 c_phone = normalize_phone(row_dict.get("טלפון", "") or row_dict.get("טלפון לקוח", "") or row_dict.get("מספר", ""))
-                                
                                 if c_name and c_phone:
                                     new_customer_contacts[c_phone] = c_name
                             break
@@ -365,7 +362,6 @@ async def yemot_api_request(endpoint: str, params: dict = None, method: str = "G
 
 
 async def append_to_yemot_log(caller_phone: str, customer_name: str, agent_phone: str, agent_name: str, date_str: str, time_str: str, is_anonymous: bool):
-    """רישום שורת לוג במערכת ימות המשיח ב-ivr2:30/Log.ini"""
     try:
         res_get = await yemot_api_request("GetTextFile", params={"what": YEMOT_LOG_FILE_PATH}, timeout=4.0)
         current_content = ""
@@ -393,10 +389,7 @@ async def append_to_yemot_log(caller_phone: str, customer_name: str, agent_phone
         )
 
         if res_upload and res_upload.get("responseStatus") == "OK":
-            root_logger.info(f"קובץ הלוג ב-30 עודכן: {new_entry}")
-        else:
-            root_logger.warning(f"שגיאה בעדכון קובץ הלוג בשלוחה 30: {res_upload}")
-
+            root_logger.info(f"קובץ הלוג עודכן: {new_entry}")
     except Exception as e:
         root_logger.error(f"שגיאה ברישום לוג בימות המשיח: {e}")
 
@@ -497,7 +490,6 @@ async def run_tzintuk_loop(target_key: str, get_phones_func):
 
 
 async def find_free_room(dept_id: str) -> Tuple[str, int]:
-    """מאתר חדר פנוי (במחלקה, או גולש ל-4 ול-5)"""
     active_calls = await get_active_calls()
     active_paths = [str(c.get("path", "")) for c in (active_calls or [])]
 
@@ -627,7 +619,7 @@ async def yemot_router(request: Request):
     if not call_id:
         return Response("id_list_message=t-מזהה שיחה חסר&go_to_folder=..", media_type="text/plain; charset=utf-8")
 
-    # 2. מניעת חזרה לתור: העברה נקייה ללא שגיאות הקראה
+    # 2. מניעת חזרה לתור: העברה ישירה לחדר
     if call_id in manager.waiting_destinations or call_id in manager.transferred_calls:
         destination = manager.waiting_destinations.get(call_id) or manager.transferred_calls.get(call_id)
         if call_id in manager.waiting_events:
@@ -636,54 +628,61 @@ async def yemot_router(request: Request):
         return Response(f"id_list_message=t-מעביר אותך לשיחה&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 3. שלוחה 30: השמעת פרטי השיחה (מתוקן לחלוטין ללא שגיאות TTS!)
+    # 3. מקש 0 בעת שמיעת הקלטות / שלוחה 30: השמעת פרטים וחזרה להקלטה!
     # ==============================================================
     sub_ext_raw = api_extension
     if BASE_FOLDER and sub_ext_raw.startswith(f"{BASE_FOLDER}/"):
         sub_ext_raw = sub_ext_raw[len(BASE_FOLDER) + 1:]
 
+    # בדיקת מקש 0: נשלח כ-PressKey ממודול playfile או digits/data
+    pressed_key = params.get("PressKey") or params.get("digits") or params.get("data") or params.get("key") or ""
+    is_key_0 = pressed_key == "0" or api_extension.endswith("/0")
+    what_file = params.get("what") or params.get("file") or params.get("filename") or ""
+
     is_ext_30 = (
         sub_ext_raw in ["30", "30/0"] or 
         api_extension in ["30", "30/0", build_path("30"), build_path("30/0")] or
         api_extension.endswith("/30") or
-        api_extension.endswith("/30/0")
+        api_extension.endswith("/30/0") or
+        bool(what_file)
     )
-    pressed_key = params.get("digits") or params.get("data") or params.get("key") or ("0" if api_extension.endswith("/0") else "")
 
-    if is_ext_30:
-        if pressed_key == "0" or api_extension.endswith("/0"):
+    if is_ext_30 and is_key_0:
+        rec = None
+        
+        # 1. ניסיון איתור לפי שם הקובץ המושמע (מהפרמטר what של playfile, למשל 001.wav)
+        match_wav = re.search(r'(\d{3}\.wav)', what_file, re.IGNORECASE)
+        target_wav = match_wav.group(1) if match_wav else ""
+
+        if target_wav:
+            res_log = await yemot_api_request("GetTextFile", params={"what": YEMOT_LOG_FILE_PATH}, timeout=4.0)
+            if res_log and res_log.get("responseStatus") == "OK":
+                for line in res_log.get("contents", "").splitlines():
+                    if line.startswith(f"{target_wav}="):
+                        parts = line.split("=")[-1].split("|")
+                        if len(parts) >= 6:
+                            rec = {
+                                "date_str": parts[0],
+                                "time_str": parts[1],
+                                "agent_phone": parts[2],
+                                "agent_name": parts[3],
+                                "caller_phone": parts[4],
+                                "caller_name": parts[5],
+                                "is_anonymous": False
+                            }
+                            break
+
+        # 2. גיבוי: שליפה לפי מזהה השיחה או טלפון המאזין
+        if not rec:
             rec = manager.call_history.get(call_id) or manager.last_call_by_phone.get(caller_phone)
-            
-            # שליפה מקובץ Log.ini בימות המשיח במקרה של הפעלה מחדש
-            if not rec:
-                res_log = await yemot_api_request("GetTextFile", params={"what": YEMOT_LOG_FILE_PATH}, timeout=4.0)
-                if res_log and res_log.get("responseStatus") == "OK":
-                    lines = res_log.get("contents", "").splitlines()
-                    for line in reversed(lines):
-                        if caller_phone in line:
-                            parts = line.split("=")[-1].split("|")
-                            if len(parts) >= 6:
-                                rec = {
-                                    "date_str": parts[0],
-                                    "time_str": parts[1],
-                                    "agent_phone": parts[2],
-                                    "agent_name": parts[3],
-                                    "caller_phone": parts[4],
-                                    "caller_name": parts[5],
-                                    "is_anonymous": False
-                                }
-                                break
 
-            if rec:
-                # הרכבת הודעה תקנית לחלוטין למנוע ההקראה
-                tts_msg = format_call_details_message(rec)
-                display_who = rec.get("caller_name") or caller_phone
-                root_logger.info(f"שלוחה 30: הושמעו פרטי שיחה למאזין {display_who}")
-                return Response(f"id_list_message={tts_msg}&go_to_folder=hangup", media_type="text/plain; charset=utf-8")
-            else:
-                return Response("id_list_message=t-לא נמצאו פרטי שיחה קודמת במערכת&go_to_folder=hangup", media_type="text/plain; charset=utf-8")
+        if rec:
+            tts_msg = format_recording_details_tts(rec)
+            root_logger.info(f"הושמעו פרטי שיחה: {tts_msg}")
+            # ללא go_to_folder=hangup - ימות המשיח חוזרת מיד להמשך שמיעת ההקלטה!
+            return Response(f"id_list_message={tts_msg}", media_type="text/plain; charset=utf-8")
         else:
-            return Response("read=t-לשמיעת פרטי השיחה הקישו 0=digits,1,1,1,7,No,No,0", media_type="text/plain; charset=utf-8")
+            return Response("id_list_message=t-לא נמצאו פרטים על שיחה זו", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
     # 4. שלוחת הנציגים/מנהלים הכללית (שלוחה 00/20)
@@ -708,7 +707,7 @@ async def yemot_router(request: Request):
                 caller_ident = selected_call.caller_name or selected_call.phone
                 root_logger.info(f"מושך שיחה אישית עבור {caller_phone} (מאזין: {caller_ident})")
 
-            # עדיפות 2: שיחה כללית במחלקות שהנציג מורשה בהן
+            # עדיפות 2: שיחה כללית
             if not selected_call:
                 allowed_depts = sheet_data.agent_to_depts.get(caller_phone, set())
                 general_calls = [
@@ -763,7 +762,7 @@ async def yemot_router(request: Request):
                 manager.call_history[selected_call.call_id] = call_record
                 manager.last_call_by_phone[selected_call.phone] = call_record
 
-                # עדכון קובץ הלוג ב-30
+                # עדכון הלוג ב-30
                 asyncio.create_task(
                     append_to_yemot_log(
                         caller_phone=selected_call.phone,
@@ -781,8 +780,6 @@ async def yemot_router(request: Request):
 
                 c_display = f"{customer_name} ({selected_call.phone})" if customer_name else selected_call.phone
                 root_logger.info(f"שידוך הצליח בתיקייה {chosen_folder} חדר {free_room}: נציג {caller_phone} ומאזין {c_display}")
-                
-                # מעבר נקי ותקני לנציג: הודעת TTS נקייה + go_to_folder נפרד
                 return Response(f"id_list_message=t-מעביר אותך לשיחה&go_to_folder={agent_dest}", media_type="text/plain; charset=utf-8")
             else:
                 root_logger.info(f"נציג {caller_phone} ממתין בשלוחה 20 לשיחה הבאה.")
@@ -878,8 +875,6 @@ async def yemot_router(request: Request):
         
         display_caller = f"{customer_name} ({caller_phone})" if customer_name else caller_phone
         root_logger.info(f"מאזין {display_caller} שוחרר מההמתנה ועובר ל-{destination} ({transfer_msg})")
-        
-        # מעבר נקי ותקני למאזין: הודעת TTS נקייה + go_to_folder נפרד
         return Response(f"id_list_message=t-{transfer_msg}&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
         
     except asyncio.TimeoutError:
