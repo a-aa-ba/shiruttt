@@ -26,7 +26,7 @@ GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lSf6FK2wjCMwu-oZzrBs
 WAIT_TIMEOUT = 50                # שניות המתנה רציפה בבקשת HTTP
 GRACE_PERIOD = WAIT_TIMEOUT + 30 # זמן חסד לסנכרון שיחות מנותקות
 
-# קובץ אינדיקציה שהחדרים כבר הוקמו (מונע הקמה חוזרת בהפעלות הבאות)
+# קובץ אינדיקציה שהחדרים כבר הוקמו
 ROOMS_FLAG_FILE = ".rooms_created"
 # ============================================================
 
@@ -240,11 +240,11 @@ async def yemot_api_request(endpoint: str, params: dict = None):
         return None
 
 
-async def upload_text_file(what_path: str, contents: str) -> bool:
-    """מעלה קובץ ext.ini דרך פקודת UploadTextFile של ימות המשיח"""
+async def upload_text_file(what_path: str, contents: str):
+    """מעלה קובץ ext.ini דרך UploadTextFile ומדפיס ללוג את תשובת ימות המשיח במלואה"""
     if not YEMOT_API_TOKEN or YEMOT_API_TOKEN == "your_actual_token_here":
-        log_call.error("שגיאה: טוקן ה-API לא מוגדר בקוד! (YEMOT_API_TOKEN)")
-        return False
+        root_logger.error("שגיאה: טוקן ה-API לא מוגדר בקוד! (YEMOT_API_TOKEN)")
+        return None
 
     url = "https://private.call2all.co.il/ym/api/UploadTextFile"
     data = {
@@ -254,47 +254,67 @@ async def upload_text_file(what_path: str, contents: str) -> bool:
     }
     try:
         async with httpx.AsyncClient() as client:
-            res = await client.post(url, data=data, timeout=10.0)
-            result = res.json()
-            return result.get("responseStatus") == "OK"
+            res = await client.post(url, data=data, timeout=15.0)
+            raw_text = res.text
+            root_logger.info(f"[UploadTextFile] יעד: {what_path} | HTTP {res.status_code} | תשובת ימות: {raw_text}")
+            try:
+                return res.json()
+            except Exception:
+                return {"raw": raw_text}
     except Exception as e:
-        root_logger.error(f"שגיאה בהעלאת קובץ {what_path}: {e}")
-        return False
+        root_logger.exception(f"תקלת תקשורת מול ימות המשיח בעת העלאת {what_path}: {e}")
+        return None
 
 
 async def ensure_rooms_setup():
-    """יוצר את 14 החדרים פעם אחת בלבד בעלייה הראשונה של השרת"""
+    """יוצר את 14 החדרים ומדפיס ללוג את התוצאות המלאות"""
     if os.path.exists(ROOMS_FLAG_FILE):
-        return  # החדרים כבר הוקמו בעבר
+        root_logger.info(f"קובץ האינדיקציה {ROOMS_FLAG_FILE} קיים. מדלג על הקמת חדרים.")
+        return
 
-    root_logger.info("הפעלה ראשונה זוהתה: מתחיל בהקמת 14 חדרי השיחה בימות המשיח...")
+    root_logger.info("מתחיל בהקמת 14 חדרי השיחה בימות המשיח ובדיקת תשובות השרת...")
     depts = list(sheet_data.dept_general_agents.keys()) if sheet_data.dept_general_agents else ["1"]
     success_count = 0
+    total_files = 0
 
     for dept_id in depts:
         for r in range(1, 15):
             rooms_base = build_path(f"{dept_id}/rooms/{r}")
 
             # 1. שלוחת מאזין
+            total_files += 1
             path_listener = f"ivr2:/{rooms_base}/1/ext.ini"
-            if await upload_text_file(path_listener, LISTENER_EXT_INI):
+            res_listener = await upload_text_file(path_listener, LISTENER_EXT_INI)
+            if res_listener and res_listener.get("responseStatus") == "OK":
                 success_count += 1
-            await asyncio.sleep(0.2)
+            else:
+                root_logger.error(f"שגיאה ביצירת מאזין בחדר {r} ({path_listener}): {res_listener}")
+
+            await asyncio.sleep(0.3)
 
             # 2. שלוחת נציג
+            total_files += 1
             path_agent = f"ivr2:/{rooms_base}/2/ext.ini"
-            if await upload_text_file(path_agent, AGENT_EXT_INI):
+            res_agent = await upload_text_file(path_agent, AGENT_EXT_INI)
+            if res_agent and res_agent.get("responseStatus") == "OK":
                 success_count += 1
-            await asyncio.sleep(0.2)
+            else:
+                root_logger.error(f"שגיאה ביצירת נציג בחדר {r} ({path_agent}): {res_agent}")
 
-    root_logger.info(f"הקמת החדרים הסתיימה בהצלחה! הוגדרו {success_count} שלוחות.")
+            await asyncio.sleep(0.3)
 
-    # כתיבת קובץ אינדיקציה כדי שהפעולה לא תחזור על עצמה
-    try:
-        with open(ROOMS_FLAG_FILE, "w", encoding="utf-8") as f:
-            f.write(f"initialized on {datetime.datetime.now()}")
-    except Exception as e:
-        root_logger.error(f"שגיאה בשמירת קובץ האינדיקציה {ROOMS_FLAG_FILE}: {e}")
+    root_logger.info(f"סיכום הקמת חדרים: {success_count} מתוך {total_files} שלוחות הוקמו בהצלחה.")
+
+    # יוצר קובץ אינדיקציה אך ורק אם לפחות שלוחה אחת נוצרה בהצלחה
+    if success_count > 0:
+        try:
+            with open(ROOMS_FLAG_FILE, "w", encoding="utf-8") as f:
+                f.write(f"initialized on {datetime.datetime.now()}")
+            root_logger.info(f"קובץ האינדיקציה {ROOMS_FLAG_FILE} נשמר.")
+        except Exception as e:
+            root_logger.error(f"שגיאה בכתיבת קובץ האינדיקציה: {e}")
+    else:
+        root_logger.error("אף שלוחה לא הוקמה בהצלחה! קובץ האינדיקציה לא נשמר כדי לאפשר ניסיון נוסף.")
 
 
 async def get_active_calls():
@@ -322,7 +342,6 @@ async def send_tzintuk(phone: str):
         log_tzintuk.error(f"מספר טלפון שגוי ({clean_phone}). הצינתוק בוטל.")
         return
 
-    # שליחה תמיד לרשימת צינתוקים שמספרה הוא מספר הטלפון של הנציג
     target_list = f"tzl:{clean_phone}"
     log_tzintuk.info(f"שולח פקודת RunTzintuk לימות המשיח (יעד: {target_list})...")
 
@@ -390,8 +409,6 @@ async def run_tzintuk_loop(target_key: str, get_phones_func):
                             return
                     log_tzintuk.warning(f"נציג {phone} נכנס לקו אך לא לקח את השיחה תוך 10 שניות. עובר לנציג הבא.")
 
-                # אם הנציג לא ענה כלל או לא לקח את השיחה תוך 10 שניות - הלולאה ממשיכה לנציג הבא
-
             await asyncio.sleep(10)
 
     except asyncio.CancelledError:
@@ -451,7 +468,7 @@ async def lifespan(app: FastAPI):
     root_logger.info("שרת התורים מופעל כעת.")
     await sheet_data.reload_from_sheets()
     
-    # הקמת החדרים אוטומטית בהפעלה ראשונה בלבד
+    # הקמת החדרים והצגת כל תגובות ימות המשיח בלוג
     await ensure_rooms_setup()
     
     task = asyncio.create_task(background_cleanup_loop())
@@ -502,7 +519,7 @@ async def yemot_router(request: Request):
     if call_id:
         manager.last_seen[call_id] = time.time()
 
-    # 1. טיפול מיידי בניתוק שיחה (עוצר ומבטל את הצינתוקים באותה שנייה!)
+    # 1. טיפול מיידי בניתוק שיחה
     if hangup == "yes" and call_id:
         async with manager.lock:
             removed_call = manager.waiting_calls.pop(call_id, None)
@@ -523,7 +540,7 @@ async def yemot_router(request: Request):
         log_call.warning(f"בקשה חסרת מזהה שיחה. פרמטרים: {params}")
         return Response("id_list_message=t-מזהה שיחה חסר&go_to_folder=..", media_type="text/plain; charset=utf-8")
 
-    # 2. Race Condition: אם המאזין כבר שוחרר לחדר טרם הכניסה להמתנה
+    # 2. Race Condition
     if call_id in manager.waiting_destinations:
         destination = manager.waiting_destinations.get(call_id)
         if call_id in manager.waiting_events:
@@ -540,7 +557,7 @@ async def yemot_router(request: Request):
         async with manager.lock:
             selected_call: Optional[QueuedCall] = None
 
-            # עדיפות 1: שיחה אישית למנהל (FIFO)
+            # עדיפות 1: שיחה אישית למנהל
             personal_calls = [
                 c for c in manager.waiting_calls.values()
                 if c.queue_type == "personal" and c.target_manager_phone == caller_phone
@@ -550,7 +567,7 @@ async def yemot_router(request: Request):
                 selected_call = personal_calls[0]
                 log_agent.info(f"מנהל זוהה! מושך שיחה אישית ראשונה (מזהה: {selected_call.call_id}).")
 
-            # עדיפות 2: שיחה כללית במחלקות שהנציג מורשה בהן (FIFO)
+            # עדיפות 2: שיחה כללית במחלקות שהנציג מורשה בהן
             if not selected_call:
                 allowed_depts = sheet_data.agent_to_depts.get(caller_phone, set())
                 general_calls = [
@@ -577,7 +594,6 @@ async def yemot_router(request: Request):
                 if selected_call.call_id in manager.waiting_events:
                     manager.waiting_events[selected_call.call_id].set()
 
-                # עצירת הצינתוקים מיד עם המענה
                 t_key = f"personal_{selected_call.target_manager_phone}" if selected_call.queue_type == "personal" else f"general_{selected_call.dept_id}"
                 manager.cancel_tzintuk_if_empty(t_key)
 
@@ -595,7 +611,6 @@ async def yemot_router(request: Request):
     if BASE_FOLDER and sub_ext.startswith(f"{BASE_FOLDER}/"):
         sub_ext = sub_ext[len(BASE_FOLDER) + 1:]
 
-    # סנכרון מגוגל שיטס רק אם נכנס מאזין כשהתור היה ריק לחלוטין
     if len(manager.waiting_calls) == 0:
         log_queue.info("נכנס מאזין חדש לתור ריק - מרענן הגדרות מגוגל שיטס...")
         await sheet_data.reload_from_sheets()
@@ -620,7 +635,6 @@ async def yemot_router(request: Request):
         log_call.warning(f"שלוחה לא מזוהה בשיטס: {api_extension} (תת-שלוחה: {sub_ext})")
         return Response("id_list_message=t-שלוחה לא מוגדרת בשיטס&go_to_folder=..", media_type="text/plain; charset=utf-8")
 
-    # כניסה ראשונית של המאזין לתור
     async with manager.lock:
         if call_id not in manager.waiting_calls:
             q_call = QueuedCall(
@@ -643,14 +657,12 @@ async def yemot_router(request: Request):
                 t_key = f"general_{dept_id}"
                 phone_func = lambda: list(sheet_data.dept_general_agents.get(dept_id, []))
 
-            # הפעלת לולאת צינתוקים
             if t_key not in manager.tzintuk_tasks or manager.tzintuk_tasks[t_key].done():
                 manager.tzintuk_tasks[t_key] = asyncio.create_task(run_tzintuk_loop(t_key, phone_func))
 
             log_queue.info(f"מאזין חדש ({caller_phone}, מזהה: {call_id}) נכנס {target_title}. מיקום בתור: {pos}")
             return Response(f"id_list_message=t-מיקומך בתור {target_title} הוא {pos}&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
 
-    # כניסה חוזרת – המתנה רציפה
     event = asyncio.Event()
     manager.waiting_events[call_id] = event
 
