@@ -222,6 +222,18 @@ async def get_active_calls():
     return None
 
 
+async def is_agent_connected(phone: str) -> bool:
+    """בודק האם הנציג הרים את השפופרת ונמצא כרגע בשיחה פעילה במערכת"""
+    clean_target = normalize_phone(phone)
+    active = await get_active_calls()
+    if active:
+        for c in active:
+            caller = normalize_phone(c.get("callerId") or c.get("callerIdNum") or "")
+            if caller == clean_target:
+                return True
+    return False
+
+
 async def send_tzintuk(phone: str):
     clean_phone = normalize_phone(phone)
     if len(clean_phone) not in [9, 10]:
@@ -249,7 +261,7 @@ async def send_tzintuk(phone: str):
 
 
 async def run_tzintuk_loop(target_key: str, get_phones_func):
-    """לולאת צינתוקים שקוטעת את פעולתה מיידית ברגע שהמאזין מנתק"""
+    """לולאת צינתוקים מדורגת לפי בדיקת מענה של הנציג"""
     log_tzintuk.info(f"לולאת צינתוקים הופעלה עבור יעד: {target_key}")
     try:
         while True:
@@ -266,21 +278,42 @@ async def run_tzintuk_loop(target_key: str, get_phones_func):
                 continue
 
             for phone in phones:
-                # בדיקה מהירה לפני כל פנייה ל-API
                 if not manager.has_waiting_for_target(target_key):
                     log_tzintuk.info(f"התור התרוקן. עוצר סבב צינתוקים עבור {target_key}.")
                     return
 
+                # 1. שליחת הצינתוק (מצלצל עד 10 שניות)
                 await send_tzintuk(phone)
 
-                # השהייה של 10 שניות הניתנת לביטול מיידי אם המאזין ינתק
-                await asyncio.sleep(10)
+                # 2. בדיקה האם הנציג ענה לצינתוק ונכנס לקו (דגימה לאורך 10 שניות)
+                agent_entered = False
+                for _ in range(10):
+                    await asyncio.sleep(1)
+                    if not manager.has_waiting_for_target(target_key):
+                        log_tzintuk.info(f"התור התרוקן/נענה. מפסיק בדיקת נציג {phone}.")
+                        return
 
-            # השהייה של 20 שניות בין סבבים הניתנת לביטול מיידי
-            await asyncio.sleep(20)
+                    if await is_agent_connected(phone):
+                        agent_entered = True
+                        log_tzintuk.info(f"נציג {phone} ענה לצינתוק ונכנס למערכת.")
+                        break
+
+                # 3. אם הנציג נכנס לקו - ממתינים 10 שניות לבדוק האם הוא מושך את השיחה
+                if agent_entered:
+                    log_tzintuk.info(f"ממתין 10 שניות לנציג {phone} שיקבל את השיחה בשלוחה 20...")
+                    for _ in range(10):
+                        await asyncio.sleep(1)
+                        if not manager.has_waiting_for_target(target_key):
+                            log_tzintuk.info(f"השיחה נענתה בהצלחה. עוצר צינתוקים לשיחה זו.")
+                            return
+                    log_tzintuk.warning(f"נציג {phone} נכנס לקו אך לא לקח את השיחה תוך 10 שניות. עובר לנציג הבא.")
+
+                # אם הנציג לא ענה כלל או לא לקח את השיחה תוך 10 שניות - הלולאה ממשיכה לנציג הבא
+
+            await asyncio.sleep(10)
 
     except asyncio.CancelledError:
-        log_tzintuk.info(f"משימת הצינתוקים של {target_key} נעצרה ובוטלה מיידית (עקב ניתוק/מענה).")
+        log_tzintuk.info(f"משימת הצינתוקים של {target_key} נעצרה ובוטלה מיידית.")
     except Exception as e:
         log_tzintuk.exception(f"תקלה בלולאת הצינתוקים ({target_key}): {e}")
     finally:
@@ -301,7 +334,7 @@ def find_free_room(active_calls: list, dept_id: str) -> int:
 
 # ==================== משימות רקע (ניקוי שיחות בלבד) ====================
 async def background_cleanup_loop():
-    """בודק שיחות שנותקו ללא דיווח (סנכרון גוגל שיטס הוסר מכאן)"""
+    """בודק שיחות שנותקו ללא דיווח"""
     while True:
         try:
             if manager.waiting_calls:
@@ -334,7 +367,6 @@ async def background_cleanup_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     root_logger.info("שרת התורים מופעל כעת.")
-    # סנכרון ראשוני בלבד בעת הפעלת השרת
     await sheet_data.reload_from_sheets()
     task = asyncio.create_task(background_cleanup_loop())
     yield
@@ -395,7 +427,6 @@ async def yemot_router(request: Request):
 
             log_call.info(f"התקבל דיווח ניתוק (hangup=yes) עבור שיחה {call_id}.")
 
-            # ביטול מיידי של משימת הצינתוקים הפעילה אם התור התרוקן
             if removed_call:
                 t_key = f"personal_{removed_call.target_manager_phone}" if removed_call.queue_type == "personal" else f"general_{removed_call.dept_id}"
                 manager.cancel_tzintuk_if_empty(t_key)
@@ -553,3 +584,9 @@ async def yemot_router(request: Request):
     finally:
         manager.waiting_events.pop(call_id, None)
         manager.waiting_destinations.pop(call_id, None)
+
+
+# ==================== הפעלת השרת ====================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
