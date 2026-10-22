@@ -1,120 +1,146 @@
 from fastapi import FastAPI, Response, Request
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Set
 import asyncio
 import datetime
 import httpx
 import time
+import csv
+import io
 import re
 
 # ==================== הגדרות מערכת כלליות ====================
 YEMOT_API_TOKEN = "0775311511:124578"          # החלף בטוקן ה-API שלך
-BASE_FOLDER = "00"               # כרגע יושב תחת 00. כשתעביר לשלוחה הראשית, פשוט שנה ל-""
-WAIT_TIMEOUT = 50                # שניות המתנה רציפה בבקשת HTTP בודדת
+BASE_FOLDER = "00"               # תיקיית הבסיס (00), בעתיד ניתן לשנות ל-""
+
+# הדבק כאן את קישור השיתוף של קובץ הגוגל שיטס שלך:
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lSf6FK2wjCMwu-oZzrBsWlvPw5wXQ2RK6RJnV2h1GjM/edit?usp=sharing"
+
+WAIT_TIMEOUT = 50                # שניות המתנה רציפה בבקשת HTTP
 GRACE_PERIOD = WAIT_TIMEOUT + 30 
 # ============================================================
 
 
 def build_path(sub_path: str) -> str:
-    """עוזר לבניית נתיב מלא בהתאם ל-BASE_FOLDER"""
     sub = sub_path.strip("/")
-    if BASE_FOLDER:
-        return f"{BASE_FOLDER}/{sub}"
-    return sub
+    return f"{BASE_FOLDER}/{sub}" if BASE_FOLDER else sub
 
 
 def normalize_phone(phone: str) -> str:
-    """ניקוי מספר טלפון לפורמט ישראלי סטנדרטי (05xxxxxxxx)"""
     clean = re.sub(r'\D', '', str(phone or ""))
     if clean.startswith("972"):
         clean = "0" + clean[3:]
     return clean
 
 
-# ==================== מבנה נתוני שיחה ותורים ====================
+# ==================== מבני נתונים ====================
 @dataclass
 class QueuedCall:
     call_id: str
     phone: str
     entry_time: float
     dept_id: str
-    queue_type: str         # "general" או "personal"
-    target_manager_phone: Optional[str] = None  # רלוונטי רק בשיחה אישית
+    queue_type: str                         # "general" או "personal"
+    target_manager_phone: Optional[str]     # רלוונטי רק בשיחה אישית
+    sub_ext: str
 
 
 @dataclass
-class PersonalLineConfig:
-    sub_ext: str            # שלוחת השיחה האישית, למשל "1/4"
-    name: str               # שם המנהל
-    manager_phone: str      # מספר הנייד של המנהל שיקבל צינתוק
-
-
-@dataclass
-class DepartmentConfig:
-    dept_id: str
+class ManagerLineInfo:
     name: str
-    general_queue_ext: str        # שלוחת התור הכללי, למשל "1/3"
-    rooms_base: str               # בסיס החדרים, למשל "1/rooms"
-    tzintuk_file_path: str         # קובץ רשימת נציגים לתור הכללי
-    personal_lines: Dict[str, PersonalLineConfig] = field(default_factory=dict)
-    max_rooms: int = 10
+    phone: str
+    dept_id: str
 
 
-# ==================== הגדרת המחלקות והשלוחות ====================
-# כאן אתה מגדיר את שלוחות המחלקה. הנתיבים ייבנו אוטומטית תחת BASE_FOLDER
-DEPARTMENTS: Dict[str, DepartmentConfig] = {
-    "1": DepartmentConfig(
-        dept_id="1",
-        name="חדר ביגוד",
-        general_queue_ext="1/3",     # שלוחה 00/1/3 (תור כללי)
-        rooms_base="1/rooms",        # חדרים ייפתחו ב-00/1/rooms/{חדר}/...
-        tzintuk_file_path="ivr2:00/1/3/a.ini",  # קובץ נציגים כלליים
-        personal_lines={
-            # שלוחה 00/1/4: שיחה אישית למנהל ביגוד
-            "1/4": PersonalLineConfig(
-                sub_ext="1/4",
-                name="מנהל חדר ביגוד",
-                manager_phone="0501234567"  # המספר הנייד שיקבל צינתוק
-            )
-        }
-    ),
-    "2": DepartmentConfig(
-        dept_id="2",
-        name="חדר צצ\"א",
-        general_queue_ext="2/3",
-        rooms_base="2/rooms",
-        tzintuk_file_path="ivr2:00/2/3/a.ini",
-        personal_lines={
-            # שלוחה 00/2/4: שיחה אישית למנהל צצ"א
-            "2/4": PersonalLineConfig(
-                sub_ext="2/4",
-                name="מנהל חדר צצ\"א",
-                manager_phone="0527654321"
-            )
-        }
-    )
-}
+class SheetDataManager:
+    """ניהול משיכת ועדכון נתונים מ-Google Sheets בזמן אמת"""
+    def __init__(self, sheet_url: str):
+        self.sheet_url = sheet_url
+        self.csv_export_url = self._build_export_url(sheet_url)
+        # שלוחה -> פרטי מנהל (למשל: "1/4" -> ManagerLineInfo)
+        self.personal_lines: Dict[str, ManagerLineInfo] = {}
+        # מחלקה -> רשימת מספרי נציגים כלליים
+        self.dept_general_agents: Dict[str, Set[str]] = {}
+        # שלוחות התור הכללי (למשל: {"1/3": "1", "2/3": "2"})
+        self.general_queue_extensions: Dict[str, str] = {}
+        # מיפוי מספר טלפון -> רשימת מחלקות שהוא מורשה בהן כנציג
+        self.agent_to_depts: Dict[str, Set[str]] = {}
 
-# שלוחת הנציג המרכזית (00/20)
-CENTRAL_AGENT_EXT = "20"
-# ============================================================
+    def _build_export_url(self, url: str) -> str:
+        match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+        if match:
+            sheet_id = match.group(1)
+            return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+        return url
+
+    async def reload_from_sheets(self):
+        """משיכת ה-CSV מ-Google Sheets ועדכון המילונים"""
+        if "YOUR_SPREADSHEET_ID" in self.csv_export_url:
+            return  # עדיין לא הוגדר קישור
+            
+        try:
+            async with httpx.AsyncClient() as client:
+                res = await client.get(self.csv_export_url, timeout=10.0, follow_redirects=True)
+                if res.status_code != 200:
+                    print(f"[SHEETS] שגיאה במשיכת הגיליון: קוד סטטוס {res.status_code}")
+                    return
+
+                content = res.content.decode('utf-8-sig')
+                reader = csv.DictReader(io.StringIO(content))
+
+                new_personal_lines = {}
+                new_dept_general_agents = {}
+                new_general_queues = {}
+                new_agent_to_depts = {}
+
+                for row in reader:
+                    # ניקוי שמות העמודות מרווחים
+                    clean_row = {k.strip(): v.strip() for k, v in row.items() if k}
+                    
+                    sub_ext = clean_row.get("שלוחה", "").strip("/")
+                    name = clean_row.get("שם", "")
+                    phone = normalize_phone(clean_row.get("טלפון", ""))
+                    role = clean_row.get("תפקיד", "")
+                    dept = clean_row.get("מחלקה", "1")
+
+                    if not sub_ext or not phone:
+                        continue
+
+                    if dept not in new_dept_general_agents:
+                        new_dept_general_agents[dept] = set()
+
+                    if role == "מנהל":
+                        new_personal_lines[sub_ext] = ManagerLineInfo(name=name, phone=phone, dept_id=dept)
+                    else:  # נציג
+                        new_dept_general_agents[dept].add(phone)
+                        new_general_queues[sub_ext] = dept
+                        if phone not in new_agent_to_depts:
+                            new_agent_to_depts[phone] = set()
+                        new_agent_to_depts[phone].add(dept)
+
+                # החלפה אטומית בזיכרון
+                self.personal_lines = new_personal_lines
+                self.dept_general_agents = new_dept_general_agents
+                self.general_queue_extensions = new_general_queues
+                self.agent_to_depts = new_agent_to_depts
+
+                log_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{log_time}] [SHEETS] הגיליון סונכרן בהצלחה! מנהלים: {len(self.personal_lines)}, נציגים: {sum(len(v) for v in self.dept_general_agents.values())}")
+        except Exception as e:
+            print(f"[SHEETS] תקלה בטעינת הגיליון: {e}")
+
+
+sheet_data = SheetDataManager(GOOGLE_SHEET_URL)
 
 
 class SystemManager:
-    """מנהל המערכת הכללי: תורים, מנעולים, שיחות וצינתוקים"""
     def __init__(self):
-        # רשימת כל הממתינים בכל המערכת
         self.waiting_calls: Dict[str, QueuedCall] = {}
-        # אירועים אסינכרוניים להערת המאזין
         self.waiting_events: Dict[str, asyncio.Event] = {}
-        # יעד ההעברה של כל מאזין ששוחרר
         self.waiting_destinations: Dict[str, str] = {}
-        # זמן אחרון שנצפתה פנייה מהמאזין
         self.last_seen: Dict[str, float] = {}
-        # משימות צינתוקים פעילות לפי מפתח (למשל: "general_1" או "personal_0501234567")
         self.tzintuk_tasks: Dict[str, asyncio.Task] = {}
-        # מנעול ראשי למניעת Race Conditions במשיכת שיחות והקצאת חדרים
         self.lock = asyncio.Lock()
 
 
@@ -134,7 +160,7 @@ async def yemot_api_request(endpoint: str, params: dict = None):
             res = await client.get(url, params=p, timeout=10.0)
             return res.json()
     except Exception as e:
-        print(f"[ERROR] תקלת תקשורת ב-API ({endpoint}): {e}")
+        print(f"[ERROR] תקלת API ({endpoint}): {e}")
         return None
 
 
@@ -145,21 +171,6 @@ async def get_active_calls():
     return None
 
 
-async def fetch_general_agent_phones(file_path: str) -> List[str]:
-    data = await yemot_api_request("GetTextFile", params={"what": file_path})
-    if not data or data.get("responseStatus") != "OK":
-        return []
-    
-    clean_numbers = []
-    for line in data.get("contents", "").splitlines():
-        match = re.search(r'\d{9,12}', line.strip())
-        if match:
-            num = normalize_phone(match.group(0))
-            if num not in clean_numbers:
-                clean_numbers.append(num)
-    return clean_numbers
-
-
 async def send_tzintuk(phone: str):
     await yemot_api_request("RunTzintuk", params={
         "phones": f"tzl:{phone}",
@@ -168,11 +179,10 @@ async def send_tzintuk(phone: str):
     })
 
 
-async def run_tzintuk_loop(target_key: str, phone_provider):
-    """משימת רקע השולחת צינתוקים כל 10 שניות כל עוד יש ממתינים לתור זה"""
+async def run_tzintuk_loop(target_key: str, get_phones_func):
+    """שליחת צינתוקים כל עוד יש ממתינים לתור זה"""
     try:
         while True:
-            # בדיקה האם יש עדיין ממתינים שרלוונטיים למפתח זה
             has_waiting = False
             for call in manager.waiting_calls.values():
                 if target_key.startswith("personal_") and call.target_manager_phone == target_key.replace("personal_", ""):
@@ -185,7 +195,7 @@ async def run_tzintuk_loop(target_key: str, phone_provider):
             if not has_waiting:
                 break
 
-            phones = await phone_provider() if callable(phone_provider) else phone_provider
+            phones = get_phones_func()
             if isinstance(phones, str):
                 phones = [phones]
 
@@ -202,23 +212,27 @@ async def run_tzintuk_loop(target_key: str, phone_provider):
         manager.tzintuk_tasks.pop(target_key, None)
 
 
-def find_free_room(active_calls: list, dept_cfg: DepartmentConfig) -> int:
-    """מוודא שגם המאזין וגם הנציג אינם בחדר כדי למנוע התנגשות"""
+def find_free_room(active_calls: list, dept_id: str) -> int:
+    """איתור חדר פנוי (מוודא שגם המאזין וגם הנציג אינם בחדר)"""
     active_paths = [str(c.get("path", "")) for c in (active_calls or [])]
-    full_base = build_path(dept_cfg.rooms_base)
+    rooms_base = build_path(f"{dept_id}/rooms")
     
-    for r in range(1, dept_cfg.max_rooms + 1):
-        listener_path = f"{full_base}/{r}/1"
-        agent_path = f"{full_base}/{r}/2"
+    for r in range(1, 15):
+        listener_path = f"{rooms_base}/{r}/1"
+        agent_path = f"{rooms_base}/{r}/2"
         if not any(listener_path in p or agent_path in p for p in active_paths):
             return r
     return 1
 
 
-# ==================== סנכרון רקע וניקוי ניתוקים ====================
-async def sync_queue_monitor():
+# ==================== משימות רקע (סנכרון תור וגוגל שיטס) ====================
+async def background_sync_loop():
     while True:
         try:
+            # 1. רענון נתונים מגוגל שיטס
+            await sheet_data.reload_from_sheets()
+
+            # 2. ניקוי שיחות שנותקו ע"י המאזין
             active_calls = await get_active_calls()
             if active_calls is not None:
                 active_ids = {str(c.get("id")) for c in active_calls}
@@ -231,19 +245,21 @@ async def sync_queue_monitor():
                             to_remove.append(cid)
                             
                     for cid in to_remove:
-                        print(f"[MONITOR] שיחה {cid} נותקה ע\"י המאזין. מסיר מהתור.")
+                        print(f"[MONITOR] שיחה {cid} נותקה. הוסרה מהתור.")
                         manager.waiting_calls.pop(cid, None)
                         manager.waiting_events.pop(cid, None)
                         manager.waiting_destinations.pop(cid, None)
                         manager.last_seen.pop(cid, None)
         except Exception as e:
-            print(f"[ERROR] שגיאה בסורק הרקע: {e}")
-        await asyncio.sleep(5)
+            print(f"[ERROR] שגיאה בלולאת הרקע: {e}")
+        await asyncio.sleep(30)  # סנכרון כל 30 שניות
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(sync_queue_monitor())
+    # סנכרון ראשוני בהפעלת השרת
+    await sheet_data.reload_from_sheets()
+    task = asyncio.create_task(background_sync_loop())
     yield
     task.cancel()
 
@@ -275,7 +291,7 @@ async def yemot_router(request: Request):
     if not call_id:
         return Response("id_list_message=t-מזהה שיחה חסר&go_to_folder=..", media_type="text/plain; charset=utf-8")
 
-    # 2. Race Condition: אם המאזין כבר שוחרר לחדר טרם הכניסה להמתנה
+    # 2. פתרון Race Condition
     if call_id in manager.waiting_destinations:
         destination = manager.waiting_destinations.get(call_id)
         if call_id in manager.waiting_events:
@@ -283,59 +299,49 @@ async def yemot_router(request: Request):
         return Response(f"id_list_message=t-מעביר אותך לנציג&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 3. שלוחת הנציגים/מנהלים הכללית (שלוחה 20)
+    # 3. כניסת נציג/מנהל לשלוחה 20 הראשית
     # ==============================================================
-    agent_full_ext = build_path(CENTRAL_AGENT_EXT)
-    if api_extension == agent_full_ext or api_extension == CENTRAL_AGENT_EXT:
+    agent_full_ext = build_path("20")
+    if api_extension == agent_full_ext or api_extension == "20":
         async with manager.lock:
             selected_call: Optional[QueuedCall] = None
 
-            # שלב א': עדיפות עליונה לשיחות אישיות שמיועדות למספר זה! (לפי סדר כניסה FIFO)
-            personal_calls_for_me = [
+            # עדיפות 1: שיחה אישית למנהל (FIFO)
+            personal_calls = [
                 c for c in manager.waiting_calls.values()
                 if c.queue_type == "personal" and c.target_manager_phone == caller_phone
             ]
-            if personal_calls_for_me:
-                personal_calls_for_me.sort(key=lambda x: x.entry_time)
-                selected_call = personal_calls_for_me[0]
-                print(f"[AGENT] מנהל {caller_phone} זוהה! מושך שיחה אישית ראשונה בתור.")
+            if personal_calls:
+                personal_calls.sort(key=lambda x: x.entry_time)
+                selected_call = personal_calls[0]
+                print(f"[AGENT] מנהל מזוהה ({caller_phone}) מושך שיחה אישית ראשונה.")
 
-            # שלב ב': אם אין שיחה אישית, בדיקה האם הוא מורשה כנציג בתורים כלליים
+            # עדיפות 2: שיחה כללית במחלקות שהנציג מורשה בהן (לפי השיטס)
             if not selected_call:
-                eligible_general_calls = []
-                for c in manager.waiting_calls.values():
-                    if c.queue_type == "general":
-                        dept_cfg = DEPARTMENTS.get(c.dept_id)
-                        if dept_cfg:
-                            # קריאת הנציגים המורשים במחלקה זו
-                            phones = await fetch_general_agent_phones(dept_cfg.tzintuk_file_path)
-                            if caller_phone in phones:
-                                eligible_general_calls.append(c)
+                allowed_depts = sheet_data.agent_to_depts.get(caller_phone, set())
+                general_calls = [
+                    c for c in manager.waiting_calls.values()
+                    if c.queue_type == "general" and c.dept_id in allowed_depts
+                ]
+                if general_calls:
+                    general_calls.sort(key=lambda x: x.entry_time)
+                    selected_call = general_calls[0]
+                    print(f"[AGENT] נציג ({caller_phone}) מושך שיחה כללית ראשונה (מחלקה {selected_call.dept_id}).")
 
-                if eligible_general_calls:
-                    eligible_general_calls.sort(key=lambda x: x.entry_time)
-                    selected_call = eligible_general_calls[0]
-                    print(f"[AGENT] נציג {caller_phone} מושך שיחה כללית ראשונה בתור (מחלקה {selected_call.dept_id}).")
-
-            # שלב ג': אם נמצאה שיחה – העברה לחדר ועידה פנוי
+            # ניתוב לחדר פנוי
             if selected_call:
                 active_calls = await get_active_calls()
-                dept_cfg = DEPARTMENTS[selected_call.dept_id]
-                free_room = find_free_room(active_calls, dept_cfg)
+                free_room = find_free_room(active_calls, selected_call.dept_id)
 
-                rooms_path = build_path(f"{dept_cfg.rooms_base}/{free_room}")
-                agent_dest = f"/{rooms_path}/2"
-                listener_dest = f"/{rooms_path}/1"
+                room_folder = build_path(f"{selected_call.dept_id}/rooms/{free_room}")
+                agent_dest = f"/{room_folder}/2"
+                listener_dest = f"/{room_folder}/1"
 
-                # הסרה מהתור ושחרור המאזין
                 manager.waiting_calls.pop(selected_call.call_id, None)
                 manager.waiting_destinations[selected_call.call_id] = listener_dest
 
                 if selected_call.call_id in manager.waiting_events:
                     manager.waiting_events[selected_call.call_id].set()
-
-                log_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{log_time}] חיבור מוצלח! נציג הועבר ל-{agent_dest}, מאזין {selected_call.call_id} הועבר ל-{listener_dest}")
 
                 msg = "לשיחה אישית" if selected_call.queue_type == "personal" else "לתור הממתינים"
                 return Response(f"id_list_message=t-מעביר אותך {msg} בחדר {free_room}&go_to_folder={agent_dest}", media_type="text/plain; charset=utf-8")
@@ -343,79 +349,82 @@ async def yemot_router(request: Request):
                 return Response("id_list_message=t-אין שיחות ממתינות עבורך כעת&go_to_folder=..", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 4. כניסת מאזינים: תור כללי או שיחה אישית למנהל
+    # 4. כניסת מאזינים (תור כללי או שיחה אישית)
     # ==============================================================
-    matched_dept: Optional[DepartmentConfig] = None
+    # הסרת קידומת BASE_FOLDER אם קיימת, כדי לקבל את תת-השלוחה (למשל "1/3")
+    sub_ext = api_extension
+    if BASE_FOLDER and sub_ext.startswith(f"{BASE_FOLDER}/"):
+        sub_ext = sub_ext[len(BASE_FOLDER) + 1:]
+
     queue_type = None
     target_manager_phone = None
+    dept_id = None
+    target_title = ""
 
-    for dept_id, cfg in DEPARTMENTS.items():
-        # בדיקת תור כללי של המחלקה
-        if api_extension == build_path(cfg.general_queue_ext):
-            matched_dept = cfg
-            queue_type = "general"
-            break
-        # בדיקת שיחה אישית למנהל
-        for p_key, p_cfg in cfg.personal_lines.items():
-            if api_extension == build_path(p_cfg.sub_ext):
-                matched_dept = cfg
-                queue_type = "personal"
-                target_manager_phone = normalize_phone(p_cfg.manager_phone)
-                break
-        if matched_dept:
-            break
+    # בדיקה האם זו שלוחת שיחה אישית
+    if sub_ext in sheet_data.personal_lines:
+        p_info = sheet_data.personal_lines[sub_ext]
+        queue_type = "personal"
+        target_manager_phone = p_info.phone
+        dept_id = p_info.dept_id
+        target_title = f"לשיחה אישית עם {p_info.name}"
 
-    if not matched_dept:
-        return Response("id_list_message=t-שלוחה לא מוגדרת בשרת&go_to_folder=..", media_type="text/plain; charset=utf-8")
+    # בדיקה האם זו שלוחת תור כללי
+    elif sub_ext in sheet_data.general_queue_extensions:
+        dept_id = sheet_data.general_queue_extensions[sub_ext]
+        queue_type = "general"
+        target_title = f"לתור הכללי במחלקה {dept_id}"
 
-    # הוספת מאזין לתור (כניסה ראשונה)
+    if not queue_type:
+        return Response("id_list_message=t-שלוחה לא מוגדרת בשיטס&go_to_folder=..", media_type="text/plain; charset=utf-8")
+
+    # כניסה ראשונית של המאזין לתור
     async with manager.lock:
         if call_id not in manager.waiting_calls:
             q_call = QueuedCall(
                 call_id=call_id,
                 phone=caller_phone,
                 entry_time=time.time(),
-                dept_id=matched_dept.dept_id,
+                dept_id=dept_id,
                 queue_type=queue_type,
-                target_manager_phone=target_manager_phone
+                target_manager_phone=target_manager_phone,
+                sub_ext=sub_ext
             )
             manager.waiting_calls[call_id] = q_call
 
-            # חישוב מיקום המאזין בתת-התור הספציפי
+            # חישוב מיקום בתור
             if queue_type == "personal":
                 pos = sum(1 for c in manager.waiting_calls.values() if c.target_manager_phone == target_manager_phone)
                 t_key = f"personal_{target_manager_phone}"
-                provider = target_manager_phone
-                title = "לשיחה אישית עם המנהל"
+                phone_func = lambda: [target_manager_phone]
             else:
-                pos = sum(1 for c in manager.waiting_calls.values() if c.dept_id == matched_dept.dept_id and c.queue_type == "general")
-                t_key = f"general_{matched_dept.dept_id}"
-                provider = lambda: fetch_general_agent_phones(matched_dept.tzintuk_file_path)
-                title = f"במחלקת {matched_dept.name}"
+                pos = sum(1 for c in manager.waiting_calls.values() if c.dept_id == dept_id and c.queue_type == "general")
+                t_key = f"general_{dept_id}"
+                phone_func = lambda: list(sheet_data.dept_general_agents.get(dept_id, []))
 
-            # הפעלת משימת צינתוקים אם אינה פועלת
+            # הפעלת צינתוקים
             if t_key not in manager.tzintuk_tasks or manager.tzintuk_tasks[t_key].done():
-                manager.tzintuk_tasks[t_key] = asyncio.create_task(run_tzintuk_loop(t_key, provider))
+                manager.tzintuk_tasks[t_key] = asyncio.create_task(run_tzintuk_loop(t_key, phone_func))
 
             log_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{log_time}] מאזין {call_id} הצטרף {title}. מיקום: {pos}")
-            return Response(f"id_list_message=t-מיקומך בתור {title} הוא {pos}&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
+            print(f"[{log_time}] מאזין {call_id} הצטרף {target_title}. מיקום בתור: {pos}")
+            return Response(f"id_list_message=t-מיקומך בתור {target_title} הוא {pos}&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
 
-    # כניסה חוזרת של המאזין – מצב המתנה רציפה
+    # כניסה חוזרת – מצב המתנה רציפה
     event = asyncio.Event()
     manager.waiting_events[call_id] = event
 
     try:
         await asyncio.wait_for(event.wait(), timeout=float(WAIT_TIMEOUT))
-        destination = manager.waiting_destinations.get(call_id, f"/{build_path(matched_dept.rooms_base)}/1/1")
+        default_room = f"/{build_path(f'{dept_id}/rooms/1/1')}"
+        destination = manager.waiting_destinations.get(call_id, default_room)
         return Response(f"id_list_message=t-מעביר אותך לנציג&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
     except asyncio.TimeoutError:
-        # פקיעת זמן המתנה - השמעת מיקום חוזרת
         async with manager.lock:
             if queue_type == "personal":
                 pos = sum(1 for c in manager.waiting_calls.values() if c.target_manager_phone == target_manager_phone and c.entry_time <= manager.waiting_calls[call_id].entry_time)
             else:
-                pos = sum(1 for c in manager.waiting_calls.values() if c.dept_id == matched_dept.dept_id and c.queue_type == "general" and c.entry_time <= manager.waiting_calls[call_id].entry_time)
+                pos = sum(1 for c in manager.waiting_calls.values() if c.dept_id == dept_id and c.queue_type == "general" and c.entry_time <= manager.waiting_calls[call_id].entry_time)
         return Response(f"id_list_message=t-מיקומך בתור הוא {pos}&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
     finally:
         manager.waiting_events.pop(call_id, None)
