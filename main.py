@@ -17,39 +17,17 @@ import re
 # טוקן ה-API המלא שלך מימות המשיח:
 YEMOT_API_TOKEN = "0775311511:124578"
 
-# תיקיית הבסיס (כרגע "00", כשתעביר לראשית שנה ל-"")
+# תיקיית הבסיס של התורים והנציגים (כרגע "00")
 BASE_FOLDER = "00"
+
+# שם התיקייה בשלוחה הראשית שבה נמצאים החדרים:
+ROOMS_ROOT_FOLDER = "rooms"
 
 # קישור השיתוף לגיליון גוגל שיטס:
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lSf6FK2wjCMwu-oZzrBsWlvPw5wXQ2RK6RJnV2h1GjM/edit?usp=sharing"
 
 WAIT_TIMEOUT = 50                # שניות המתנה רציפה בבקשת HTTP
 GRACE_PERIOD = WAIT_TIMEOUT + 30 # זמן חסד לסנכרון שיחות מנותקות
-
-# קובץ אינדיקציה שהחדרים כבר הוקמו
-ROOMS_FLAG_FILE = ".rooms_created"
-# ============================================================
-
-
-# ==================== הגדרות קובצי ext.ini לחדרים ====================
-LISTENER_EXT_INI = """type=confbridge
-conf_bridge_type=speech
-title_announcement=no
-confbridge_say_title=no
-confbridge_live_no_goto=wait_live
-confbridge_music_on_hold=ztomao+patiach
-confbridge_end_admin_full=1
-folder_move=/30
-conf_bridge_klikers=blocked
-conf_bridge_exit=yes
-confbridge_end_goto=hangup"""
-
-AGENT_EXT_INI = """type=confbridge
-conf_bridge_type=admin
-conf_bridge_admin_no_ask=yes
-conf_bridge_message_start_after_beep=no
-confbridge_admin_block_digits=yes
-conf_bridge_folder_to_play=/1/1/1"""
 # ============================================================
 
 
@@ -240,83 +218,6 @@ async def yemot_api_request(endpoint: str, params: dict = None):
         return None
 
 
-async def upload_text_file(what_path: str, contents: str):
-    """מעלה קובץ ext.ini דרך UploadTextFile ומדפיס אך ורק את תשובת השרת ממש"""
-    if not YEMOT_API_TOKEN or YEMOT_API_TOKEN == "your_actual_token_here":
-        print(f"[{what_path}] שגיאה: טוקן ה-API אינו מוגדר בקוד!")
-        root_logger.error(f"[{what_path}] שגיאה: טוקן ה-API אינו מוגדר בקוד!")
-        return None
-
-    url = "https://private.call2all.co.il/ym/api/UploadTextFile"
-    data = {
-        "token": YEMOT_API_TOKEN,
-        "what": what_path,
-        "contents": contents
-    }
-    try:
-        async with httpx.AsyncClient() as client:
-            res = await client.post(url, data=data, timeout=15.0)
-            server_response = res.text
-            
-            # הדפסת תשובת השרת ממש לקונסול וללוג
-            print(f"[{what_path}] תשובת שרת ימות המשיח: {server_response}")
-            root_logger.info(f"[{what_path}] תשובת שרת ימות המשיח: {server_response}")
-            
-            try:
-                return res.json()
-            except Exception:
-                return {"raw": server_response}
-    except Exception as e:
-        print(f"[{what_path}] תקלת תקשורת: {e}")
-        root_logger.exception(f"[{what_path}] תקלת תקשורת: {e}")
-        return None
-
-
-async def ensure_rooms_setup():
-    """יוצר את 14 החדרים ומדפיס את תשובת השרת ממש עבור כל שלוחה"""
-    if os.path.exists(ROOMS_FLAG_FILE):
-        print(f"קובץ האינדיקציה {ROOMS_FLAG_FILE} קיים. מדלג על הקמת חדרים.")
-        root_logger.info(f"קובץ האינדיקציה {ROOMS_FLAG_FILE} קיים. מדלג על הקמת חדרים.")
-        return
-
-    print("מתחיל בשליחת בקשות הקמת חדרים לימות המשיח:")
-    root_logger.info("מתחיל בשליחת בקשות הקמת חדרים לימות המשיח:")
-    depts = list(sheet_data.dept_general_agents.keys()) if sheet_data.dept_general_agents else ["1"]
-    success_count = 0
-
-    for dept_id in depts:
-        for r in range(1, 15):
-            rooms_base = build_path(f"{dept_id}/rooms/{r}")
-
-            # 1. שלוחת מאזין (ללא סלאש אחרי הנקודתיים)
-            path_listener = f"ivr2:{rooms_base}/1/ext.ini"
-            res_listener = await upload_text_file(path_listener, LISTENER_EXT_INI)
-            if res_listener and res_listener.get("responseStatus") == "OK":
-                success_count += 1
-
-            await asyncio.sleep(0.3)
-
-            # 2. שלוחת נציג (ללא סלאש אחרי הנקודתיים)
-            path_agent = f"ivr2:{rooms_base}/2/ext.ini"
-            res_agent = await upload_text_file(path_agent, AGENT_EXT_INI)
-            if res_agent and res_agent.get("responseStatus") == "OK":
-                success_count += 1
-
-            await asyncio.sleep(0.3)
-
-    if success_count > 0:
-        try:
-            with open(ROOMS_FLAG_FILE, "w", encoding="utf-8") as f:
-                f.write(f"initialized on {datetime.datetime.now()}")
-            print(f"הקמת החדרים הושלמה בהצלחה ({success_count} שלוחות נוצרו).")
-            root_logger.info(f"הקמת החדרים הושלמה בהצלחה ({success_count} שלוחות נוצרו).")
-        except Exception as e:
-            root_logger.error(f"שגיאה בכתיבת קובץ האינדיקציה: {e}")
-    else:
-        print("לא נוצרו שלוחות בהצלחה. קובץ האינדיקציה לא נשמר.")
-        root_logger.error("לא נוצרו שלוחות בהצלחה. קובץ האינדיקציה לא נשמר.")
-
-
 async def get_active_calls():
     data = await yemot_api_request("GetIncomingCalls")
     if data and data.get("responseStatus") == "OK":
@@ -420,10 +321,11 @@ async def run_tzintuk_loop(target_key: str, get_phones_func):
 
 
 def find_free_room(active_calls: list, dept_id: str) -> int:
+    """מאתר חדר פנוי בין 1 ל-5 בתוך התיקייה הראשית rooms/{dept_id}"""
     active_paths = [str(c.get("path", "")) for c in (active_calls or [])]
-    rooms_base = build_path(f"{dept_id}/rooms")
+    rooms_base = f"{ROOMS_ROOT_FOLDER}/{dept_id}"
     
-    for r in range(1, 15):
+    for r in range(1, 6):
         listener_path = f"{rooms_base}/{r}/1"
         agent_path = f"{rooms_base}/{r}/2"
         if not any(listener_path in p or agent_path in p for p in active_paths):
@@ -467,10 +369,6 @@ async def background_cleanup_loop():
 async def lifespan(app: FastAPI):
     root_logger.info("שרת התורים מופעל כעת.")
     await sheet_data.reload_from_sheets()
-    
-    # הקמת החדרים עם הדפסת תשובת השרת ממש
-    await ensure_rooms_setup()
-    
     task = asyncio.create_task(background_cleanup_loop())
     yield
     task.cancel()
@@ -549,7 +447,7 @@ async def yemot_router(request: Request):
         return Response(f"id_list_message=t-מעביר אותך לנציג&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 3. שלוחת הנציגים/מנהלים הכללית (שלוחה 20)
+    # 3. שלוחת הנציגים/מנהלים הכללית (שלוחה 00/20)
     # ==============================================================
     agent_full_ext = build_path("20")
     if api_extension == agent_full_ext or api_extension == "20":
@@ -579,14 +477,14 @@ async def yemot_router(request: Request):
                     selected_call = general_calls[0]
                     log_agent.info(f"נציג זוהה! מושך שיחה כללית במחלקה {selected_call.dept_id} (מזהה: {selected_call.call_id}).")
 
-            # שידוך לחדר פנוי
+            # שידוך לחדר פנוי (ניווט ישיר לחדר בשלוחה הראשית)
             if selected_call:
                 active_calls = await get_active_calls()
                 free_room = find_free_room(active_calls, selected_call.dept_id)
 
-                room_folder = build_path(f"{selected_call.dept_id}/rooms/{free_room}")
-                agent_dest = f"/{room_folder}/2"
-                listener_dest = f"/{room_folder}/1"
+                # הניווט מתחיל בסלאש ומפנה ישירות לראשית: /rooms/{dept}/{room}/
+                agent_dest = f"/{ROOMS_ROOT_FOLDER}/{selected_call.dept_id}/{free_room}/2"
+                listener_dest = f"/{ROOMS_ROOT_FOLDER}/{selected_call.dept_id}/{free_room}/1"
 
                 manager.waiting_calls.pop(selected_call.call_id, None)
                 manager.waiting_destinations[selected_call.call_id] = listener_dest
@@ -597,7 +495,7 @@ async def yemot_router(request: Request):
                 t_key = f"personal_{selected_call.target_manager_phone}" if selected_call.queue_type == "personal" else f"general_{selected_call.dept_id}"
                 manager.cancel_tzintuk_if_empty(t_key)
 
-                log_agent.info(f"שידוך הצליח! חדר: {free_room}. נציג: {agent_dest}, מאזין: {listener_dest}")
+                log_agent.info(f"שידוך הצליח! חדר: {free_room}. נציג מועבר ל: {agent_dest}, מאזין מועבר ל: {listener_dest}")
                 msg = "לשיחה אישית" if selected_call.queue_type == "personal" else "לתור הממתינים"
                 return Response(f"id_list_message=t-מעביר אותך {msg} בחדר {free_room}&go_to_folder={agent_dest}", media_type="text/plain; charset=utf-8")
             else:
@@ -668,9 +566,9 @@ async def yemot_router(request: Request):
 
     try:
         await asyncio.wait_for(event.wait(), timeout=float(WAIT_TIMEOUT))
-        default_room = f"/{build_path(f'{dept_id}/rooms/1/1')}"
+        default_room = f"/{ROOMS_ROOT_FOLDER}/{dept_id}/1/1"
         destination = manager.waiting_destinations.get(call_id, default_room)
-        log_queue.info(f"מאזין {call_id} שוחרר מההמתנה! מעביר ליעד: {destination}")
+        log_queue.info(f"מאזין {call_id} שוחרר מההמתנה! מעביר ליעד בראשי: {destination}")
         return Response(f"id_list_message=t-מעביר אותך לנציג&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
     except asyncio.TimeoutError:
         async with manager.lock:
