@@ -28,7 +28,7 @@ ROOMS_ROOT_FOLDER = "rooms"
 YEMOT_LOG_FILE_PATH = f"ivr2:{BASE_FOLDER}/30/Log.ini" if BASE_FOLDER else "ivr2:30/Log.ini"
 
 # קישור השיתוף לגיליון גוגל שיטס:
-GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lSf6FK2wjCMwu-oZzrBsWlvPw5wXQ2RK6RJnV2h1GjM/edit?usp=sharing"
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1LsV4NcF0C62RGo002J1tdtIG1OhDZAHcCKj6QLnNGJk/edit?usp=sharing"
 
 # שמות הטאבים (גליונות) בשיטס – גליון לכל מחלקה:
 DEPARTMENT_TABS = ["1", "2", "3"]
