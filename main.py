@@ -241,9 +241,10 @@ async def yemot_api_request(endpoint: str, params: dict = None):
 
 
 async def upload_text_file(what_path: str, contents: str):
-    """מעלה קובץ ext.ini דרך UploadTextFile ומדפיס ללוג את תשובת ימות המשיח במלואה"""
+    """מעלה קובץ ext.ini דרך UploadTextFile ומדפיס אך ורק את תשובת השרת ממש"""
     if not YEMOT_API_TOKEN or YEMOT_API_TOKEN == "your_actual_token_here":
-        root_logger.error("שגיאה: טוקן ה-API לא מוגדר בקוד! (YEMOT_API_TOKEN)")
+        print(f"[{what_path}] שגיאה: טוקן ה-API אינו מוגדר בקוד!")
+        root_logger.error(f"[{what_path}] שגיאה: טוקן ה-API אינו מוגדר בקוד!")
         return None
 
     url = "https://private.call2all.co.il/ym/api/UploadTextFile"
@@ -255,66 +256,65 @@ async def upload_text_file(what_path: str, contents: str):
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post(url, data=data, timeout=15.0)
-            raw_text = res.text
-            root_logger.info(f"[UploadTextFile] יעד: {what_path} | HTTP {res.status_code} | תשובת ימות: {raw_text}")
+            server_response = res.text
+            
+            # הדפסת תשובת השרת ממש לקונסול וללוג
+            print(f"[{what_path}] תשובת שרת ימות המשיח: {server_response}")
+            root_logger.info(f"[{what_path}] תשובת שרת ימות המשיח: {server_response}")
+            
             try:
                 return res.json()
             except Exception:
-                return {"raw": raw_text}
+                return {"raw": server_response}
     except Exception as e:
-        root_logger.exception(f"תקלת תקשורת מול ימות המשיח בעת העלאת {what_path}: {e}")
+        print(f"[{what_path}] תקלת תקשורת: {e}")
+        root_logger.exception(f"[{what_path}] תקלת תקשורת: {e}")
         return None
 
 
 async def ensure_rooms_setup():
-    """יוצר את 14 החדרים ומדפיס ללוג את התוצאות המלאות"""
+    """יוצר את 14 החדרים ומדפיס את תשובת השרת ממש עבור כל שלוחה"""
     if os.path.exists(ROOMS_FLAG_FILE):
+        print(f"קובץ האינדיקציה {ROOMS_FLAG_FILE} קיים. מדלג על הקמת חדרים.")
         root_logger.info(f"קובץ האינדיקציה {ROOMS_FLAG_FILE} קיים. מדלג על הקמת חדרים.")
         return
 
-    root_logger.info("מתחיל בהקמת 14 חדרי השיחה בימות המשיח ובדיקת תשובות השרת...")
+    print("מתחיל בשליחת בקשות הקמת חדרים לימות המשיח:")
+    root_logger.info("מתחיל בשליחת בקשות הקמת חדרים לימות המשיח:")
     depts = list(sheet_data.dept_general_agents.keys()) if sheet_data.dept_general_agents else ["1"]
     success_count = 0
-    total_files = 0
 
     for dept_id in depts:
         for r in range(1, 15):
             rooms_base = build_path(f"{dept_id}/rooms/{r}")
 
-            # 1. שלוחת מאזין
-            total_files += 1
-            path_listener = f"ivr2:/{rooms_base}/1/ext.ini"
+            # 1. שלוחת מאזין (ללא סלאש אחרי הנקודתיים)
+            path_listener = f"ivr2:{rooms_base}/1/ext.ini"
             res_listener = await upload_text_file(path_listener, LISTENER_EXT_INI)
             if res_listener and res_listener.get("responseStatus") == "OK":
                 success_count += 1
-            else:
-                root_logger.error(f"שגיאה ביצירת מאזין בחדר {r} ({path_listener}): {res_listener}")
 
             await asyncio.sleep(0.3)
 
-            # 2. שלוחת נציג
-            total_files += 1
-            path_agent = f"ivr2:/{rooms_base}/2/ext.ini"
+            # 2. שלוחת נציג (ללא סלאש אחרי הנקודתיים)
+            path_agent = f"ivr2:{rooms_base}/2/ext.ini"
             res_agent = await upload_text_file(path_agent, AGENT_EXT_INI)
             if res_agent and res_agent.get("responseStatus") == "OK":
                 success_count += 1
-            else:
-                root_logger.error(f"שגיאה ביצירת נציג בחדר {r} ({path_agent}): {res_agent}")
 
             await asyncio.sleep(0.3)
 
-    root_logger.info(f"סיכום הקמת חדרים: {success_count} מתוך {total_files} שלוחות הוקמו בהצלחה.")
-
-    # יוצר קובץ אינדיקציה אך ורק אם לפחות שלוחה אחת נוצרה בהצלחה
     if success_count > 0:
         try:
             with open(ROOMS_FLAG_FILE, "w", encoding="utf-8") as f:
                 f.write(f"initialized on {datetime.datetime.now()}")
-            root_logger.info(f"קובץ האינדיקציה {ROOMS_FLAG_FILE} נשמר.")
+            print(f"הקמת החדרים הושלמה בהצלחה ({success_count} שלוחות נוצרו).")
+            root_logger.info(f"הקמת החדרים הושלמה בהצלחה ({success_count} שלוחות נוצרו).")
         except Exception as e:
             root_logger.error(f"שגיאה בכתיבת קובץ האינדיקציה: {e}")
     else:
-        root_logger.error("אף שלוחה לא הוקמה בהצלחה! קובץ האינדיקציה לא נשמר כדי לאפשר ניסיון נוסף.")
+        print("לא נוצרו שלוחות בהצלחה. קובץ האינדיקציה לא נשמר.")
+        root_logger.error("לא נוצרו שלוחות בהצלחה. קובץ האינדיקציה לא נשמר.")
 
 
 async def get_active_calls():
@@ -468,7 +468,7 @@ async def lifespan(app: FastAPI):
     root_logger.info("שרת התורים מופעל כעת.")
     await sheet_data.reload_from_sheets()
     
-    # הקמת החדרים והצגת כל תגובות ימות המשיח בלוג
+    # הקמת החדרים עם הדפסת תשובת השרת ממש
     await ensure_rooms_setup()
     
     task = asyncio.create_task(background_cleanup_loop())
