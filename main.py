@@ -25,6 +25,31 @@ GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lSf6FK2wjCMwu-oZzrBs
 
 WAIT_TIMEOUT = 50                # שניות המתנה רציפה בבקשת HTTP
 GRACE_PERIOD = WAIT_TIMEOUT + 30 # זמן חסד לסנכרון שיחות מנותקות
+
+# קובץ אינדיקציה שהחדרים כבר הוקמו (מונע הקמה חוזרת בהפעלות הבאות)
+ROOMS_FLAG_FILE = ".rooms_created"
+# ============================================================
+
+
+# ==================== הגדרות קובצי ext.ini לחדרים ====================
+LISTENER_EXT_INI = """type=confbridge
+conf_bridge_type=speech
+title_announcement=no
+confbridge_say_title=no
+confbridge_live_no_goto=wait_live
+confbridge_music_on_hold=ztomao+patiach
+confbridge_end_admin_full=1
+folder_move=/30
+conf_bridge_klikers=blocked
+conf_bridge_exit=yes
+confbridge_end_goto=hangup"""
+
+AGENT_EXT_INI = """type=confbridge
+conf_bridge_type=admin
+conf_bridge_admin_no_ask=yes
+conf_bridge_message_start_after_beep=no
+confbridge_admin_block_digits=yes
+conf_bridge_folder_to_play=/1/1/1"""
 # ============================================================
 
 
@@ -215,6 +240,63 @@ async def yemot_api_request(endpoint: str, params: dict = None):
         return None
 
 
+async def upload_text_file(what_path: str, contents: str) -> bool:
+    """מעלה קובץ ext.ini דרך פקודת UploadTextFile של ימות המשיח"""
+    if not YEMOT_API_TOKEN or YEMOT_API_TOKEN == "your_actual_token_here":
+        log_call.error("שגיאה: טוקן ה-API לא מוגדר בקוד! (YEMOT_API_TOKEN)")
+        return False
+
+    url = "https://private.call2all.co.il/ym/api/UploadTextFile"
+    data = {
+        "token": YEMOT_API_TOKEN,
+        "what": what_path,
+        "contents": contents
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(url, data=data, timeout=10.0)
+            result = res.json()
+            return result.get("responseStatus") == "OK"
+    except Exception as e:
+        root_logger.error(f"שגיאה בהעלאת קובץ {what_path}: {e}")
+        return False
+
+
+async def ensure_rooms_setup():
+    """יוצר את 14 החדרים פעם אחת בלבד בעלייה הראשונה של השרת"""
+    if os.path.exists(ROOMS_FLAG_FILE):
+        return  # החדרים כבר הוקמו בעבר
+
+    root_logger.info("הפעלה ראשונה זוהתה: מתחיל בהקמת 14 חדרי השיחה בימות המשיח...")
+    depts = list(sheet_data.dept_general_agents.keys()) if sheet_data.dept_general_agents else ["1"]
+    success_count = 0
+
+    for dept_id in depts:
+        for r in range(1, 15):
+            rooms_base = build_path(f"{dept_id}/rooms/{r}")
+
+            # 1. שלוחת מאזין
+            path_listener = f"ivr2:/{rooms_base}/1/ext.ini"
+            if await upload_text_file(path_listener, LISTENER_EXT_INI):
+                success_count += 1
+            await asyncio.sleep(0.2)
+
+            # 2. שלוחת נציג
+            path_agent = f"ivr2:/{rooms_base}/2/ext.ini"
+            if await upload_text_file(path_agent, AGENT_EXT_INI):
+                success_count += 1
+            await asyncio.sleep(0.2)
+
+    root_logger.info(f"הקמת החדרים הסתיימה בהצלחה! הוגדרו {success_count} שלוחות.")
+
+    # כתיבת קובץ אינדיקציה כדי שהפעולה לא תחזור על עצמה
+    try:
+        with open(ROOMS_FLAG_FILE, "w", encoding="utf-8") as f:
+            f.write(f"initialized on {datetime.datetime.now()}")
+    except Exception as e:
+        root_logger.error(f"שגיאה בשמירת קובץ האינדיקציה {ROOMS_FLAG_FILE}: {e}")
+
+
 async def get_active_calls():
     data = await yemot_api_request("GetIncomingCalls")
     if data and data.get("responseStatus") == "OK":
@@ -368,6 +450,10 @@ async def background_cleanup_loop():
 async def lifespan(app: FastAPI):
     root_logger.info("שרת התורים מופעל כעת.")
     await sheet_data.reload_from_sheets()
+    
+    # הקמת החדרים אוטומטית בהפעלה ראשונה בלבד
+    await ensure_rooms_setup()
+    
     task = asyncio.create_task(background_cleanup_loop())
     yield
     task.cancel()
