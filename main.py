@@ -15,13 +15,13 @@ import re
 
 # ==================== הגדרות מערכת כלליות ====================
 # טוקן ה-API המלא שלך מימות המשיח:
-YEMOT_API_TOKEN = "0775311511:124578"
+YEMOT_API_TOKEN = "your_actual_token_here"
 
 # תיקיית הבסיס (כרגע "00", כשתעביר לראשית שנה ל-"")
 BASE_FOLDER = "00"
 
 # קישור השיתוף לגיליון גוגל שיטס:
-GOOGLE_SHEET_URL = " = "https://docs.google.com/spreadsheets/d/1lSf6FK2wjCMwu-oZzrBsWlvPw5wXQ2RK6RJnV2h1GjM/edit?usp=sha"
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1lSf6FK2wjCMwu-oZzrBsWlvPw5wXQ2RK6RJnV2h1GjM/edit?usp=sharing"
 
 WAIT_TIMEOUT = 50                # שניות המתנה רציפה בבקשת HTTP
 GRACE_PERIOD = WAIT_TIMEOUT + 30 # זמן חסד לסנכרון שיחות מנותקות
