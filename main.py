@@ -29,7 +29,7 @@ YEMOT_LOG_FILE_PATH = "ivr2:30/Log.ini"
 # קישור השיתוף לגיליון גוגל שיטס:
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1LsV4NcF0C62RGo002J1tdtIG1OhDZAHcCKj6QLnNGJk/edit?usp=sharing"
 
-# שמות הגליונות של המחלקות ב-Google Sheets
+# שמות הגליונות ב-Google Sheets
 DEPARTMENT_TABS = ["1", "2", "3"]
 
 # שם לשונית הלקוחות (השרת יבדוק קודם כל "לקוחות")
@@ -57,7 +57,7 @@ GRACE_PERIOD = WAIT_TIMEOUT + 30
 
 # ==================== פונקציית שעון ישראל מדויק ====================
 def get_israel_now() -> datetime.datetime:
-    """מחזיר תמיד את התאריך והשעה הנוכחיים של ישראל"""
+    """מחזיר תמיד את התאריך והשעה הנוכחיים של ישראל (למניעת שגיאת UTC)"""
     try:
         import zoneinfo
         return datetime.datetime.now(zoneinfo.ZoneInfo("Asia/Jerusalem"))
@@ -105,7 +105,6 @@ def build_path(sub_path: str) -> str:
 
 
 def normalize_phone(phone: str) -> str:
-    """ניקוי מספר טלפון והשלמת 0 מוביל אם גוגל שיטס מחק אותו"""
     clean = re.sub(r'\D', '', str(phone or ""))
     if clean.startswith("972"):
         clean = "0" + clean[3:]
@@ -114,7 +113,77 @@ def normalize_phone(phone: str) -> str:
     return clean
 
 
+def format_time_to_hebrew(time_str: str) -> str:
+    """
+    ממירה מחרוזת שעה (HH:MM) למילים עבריות תקניות ללא מקפים (למניעת השתקת ה-TTS).
+    דוגמה: 02:35 -> בשעה שתיים ושלושים וחמש דקות
+    """
+    parts = time_str.split(":")
+    if len(parts) != 2:
+        return f"בשעה {time_str}"
+    
+    try:
+        h = int(parts[0])
+        m = int(parts[1])
+    except Exception:
+        return f"בשעה {time_str}"
+
+    hours_map = {
+        0: "שתים עשרה בלילה",
+        1: "אחת",
+        2: "שתיים",
+        3: "שלוש",
+        4: "ארבע",
+        5: "חמש",
+        6: "שש",
+        7: "שבע",
+        8: "שמונה",
+        9: "תשע",
+        10: "עשר",
+        11: "אחת עשרה",
+        12: "שתים עשרה",
+        13: "אחת בצהריים",
+        14: "שתיים בצהריים",
+        15: "שלוש בצהריים",
+        16: "ארבע",
+        17: "חמש",
+        18: "שש",
+        19: "שבע",
+        20: "שמונה",
+        21: "תשע",
+        22: "עשר",
+        23: "אחת עשרה בלילה",
+    }
+    h_word = hours_map.get(h, str(h))
+
+    if m == 0:
+        return f"בשעה {h_word} בדיוק"
+
+    units = ["", "אחת", "שתיים", "שלוש", "ארבע", "חמש", "שש", "שבע", "שמונה", "תשע"]
+    teens = ["עשר", "אחת עשרה", "שתים עשרה", "שלוש עשרה", "ארבע עשרה", "חמש עשרה", "שש עשרה", "שבע עשרה", "שמונה עשרה", "תשע עשרה"]
+    tens = ["", "", "עשרים", "שלושים", "ארבעים", "חמישים"]
+
+    if 1 <= m <= 9:
+        m_word = f"ו{units[m]} דקות"
+    elif 10 <= m <= 19:
+        m_word = f"ו{teens[m - 10]} דקות"
+    else:
+        ten_part = tens[m // 10]
+        unit_part = units[m % 10]
+        if unit_part:
+            m_word = f"ו{ten_part} ו{unit_part} דקות"
+        else:
+            m_word = f"ו{ten_part} דקות"
+
+    return f"בשעה {h_word} {m_word}"
+
+
 def format_recording_details_tts(rec: dict) -> str:
+    """
+    בונה את המשפט המדויק:
+    'בתאריך X לחודש Y בשעה H ו... דקות שוחח המאזין ... עם הנציג ...'
+    במילים עבריות מלאות ללא שום מקף או שקט.
+    """
     date_str = rec.get("date_str", "")
     time_str = rec.get("time_str", "")
     agent_name = rec.get("agent_name", "").strip()
@@ -123,26 +192,23 @@ def format_recording_details_tts(rec: dict) -> str:
     customer_phone = rec.get("caller_phone", "")
     is_anon = rec.get("is_anonymous", False)
 
+    # 1. תאריך בעברית
     date_parts = date_str.split("/")
     if len(date_parts) == 3:
-        clean_date = f"{int(date_parts[0])} לחודש {int(date_parts[1])}"
+        try:
+            clean_date = f"{int(date_parts[0])} לחודש {int(date_parts[1])}"
+        except Exception:
+            clean_date = date_str.replace("/", " ")
     else:
         clean_date = date_str.replace("/", " ")
 
-    time_parts = time_str.split(":")
-    if len(time_parts) == 2:
-        hour_int = int(time_parts[0])
-        min_int = int(time_parts[1])
-        if min_int == 0:
-            time_phrase = f"בשעה {hour_int} בדיוק"
-        else:
-            time_phrase = f"בשעה {hour_int} ו-{min_int} דקות"
-    else:
-        time_phrase = f"בשעה {time_str}"
+    # 2. שעה ודקות במילים עבריות מלאות ללא מקפים
+    time_phrase = format_time_to_hebrew(time_str)
 
     segments = []
     segments.append(f"t-בתאריך {clean_date} {time_phrase}")
 
+    # המאזין
     if is_anon:
         segments.append("t-שוחח המאזין שיחה אנונימית מספר חסוי")
     elif customer_name:
@@ -153,6 +219,7 @@ def format_recording_details_tts(rec: dict) -> str:
     else:
         segments.append("t-שוחח המאזין")
 
+    # הנציג
     if agent_name:
         segments.append(f"t-עם הנציג {agent_name}")
     elif agent_phone:
@@ -340,7 +407,6 @@ class SheetDataManager:
                                 digits_b = re.sub(r'\D', '', col_b)
                                 digits_a = re.sub(r'\D', '', col_a)
 
-                                # זיהוי: עמודה A שם ועמודה B טלפון (או להיפך)
                                 if len(digits_b) >= 7:
                                     cust_name = col_a
                                     cust_phone = normalize_phone(digits_b)
@@ -353,7 +419,6 @@ class SheetDataManager:
                                 if cust_name and cust_phone:
                                     temp_contacts[cust_phone] = cust_name
 
-                            # אם נמצאו לקוחות בטאב זה, נשמור ונסיים
                             if temp_contacts:
                                 loaded_tab_name = c_tab
                                 new_customer_contacts = temp_contacts
@@ -703,7 +768,7 @@ async def yemot_router(request: Request):
         return Response(f"id_list_message=t-מעביר אותך לשיחה&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 3. מקש 0 בעת שמיעת הקלטות / שלוחה 30: השמעת פרטים
+    # 3. מקש 0 בעת שמיעת הקלטות / שלוחה 30: השמעת פרטים מלאה
     # ==============================================================
     sub_ext_raw = api_extension
     if BASE_FOLDER and sub_ext_raw.startswith(f"{BASE_FOLDER}/"):
