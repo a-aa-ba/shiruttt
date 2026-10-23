@@ -29,11 +29,11 @@ YEMOT_LOG_FILE_PATH = "ivr2:30/Log.ini"
 # קישור השיתוף לגיליון גוגל שיטס:
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1LsV4NcF0C62RGo002J1tdtIG1OhDZAHcCKj6QLnNGJk/edit?usp=sharing"
 
-# שמות הגליונות ב-Google Sheets
+# שמות הגליונות של המחלקות ב-Google Sheets
 DEPARTMENT_TABS = ["1", "2", "3"]
 
-# שם הגליון הרביעי של הלקוחות/אנשי קשר
-CONTACTS_TAB_NAME = "4"
+# שם לשונית הלקוחות (השרת יבדוק קודם כל "לקוחות")
+CONTACTS_TAB_NAME = "לקוחות"
 
 # מיפוי שמות מחלקות לתיקיות החדרים (1, 2, 3)
 DEPT_NAME_TO_ID = {
@@ -57,7 +57,7 @@ GRACE_PERIOD = WAIT_TIMEOUT + 30
 
 # ==================== פונקציית שעון ישראל מדויק ====================
 def get_israel_now() -> datetime.datetime:
-    """מחזיר תמיד את התאריך והשעה הנוכחיים של ישראל (למניעת שגיאת UTC)"""
+    """מחזיר תמיד את התאריך והשעה הנוכחיים של ישראל"""
     try:
         import zoneinfo
         return datetime.datetime.now(zoneinfo.ZoneInfo("Asia/Jerusalem"))
@@ -105,6 +105,7 @@ def build_path(sub_path: str) -> str:
 
 
 def normalize_phone(phone: str) -> str:
+    """ניקוי מספר טלפון והשלמת 0 מוביל אם גוגל שיטס מחק אותו"""
     clean = re.sub(r'\D', '', str(phone or ""))
     if clean.startswith("972"):
         clean = "0" + clean[3:]
@@ -190,7 +191,6 @@ class SheetDataManager:
     def __init__(self, sheet_url: str):
         self.sheet_url = sheet_url
         self.spreadsheet_id = self._extract_sheet_id(sheet_url)
-        # מילונים מופרדים פר מחלקה: {dept_id: {sub_ext: info}}
         self.personal_lines: Dict[str, Dict[str, ManagerLineInfo]] = {}
         self.dept_general_agents: Dict[str, Set[str]] = {}
         self.general_queue_extensions: Dict[str, Set[str]] = {}
@@ -208,7 +208,7 @@ class SheetDataManager:
             root_logger.warning("קישור Google Sheets אינו מוגדר.")
             return
 
-        root_logger.info("מרענן נתוני מחלקות, שלוחות ולקוחות מ-Google Sheets...")
+        root_logger.info("מרענן נתוני מחלקות, שלוחות ולשונית לקוחות מ-Google Sheets...")
         new_personal_lines = {}
         new_dept_general_agents = {}
         new_general_queues = {}
@@ -271,7 +271,6 @@ class SheetDataManager:
                         if name:
                             new_agent_names[phone] = name
 
-                        # שמירת השלוחה גם כפי שנכתבה וגם כספרה בודדת
                         possible_keys = {raw_sub}
                         if "/" in raw_sub:
                             possible_keys.add(raw_sub.split("/")[-1])
@@ -304,10 +303,15 @@ class SheetDataManager:
                 except Exception as e:
                     root_logger.warning(f"שגיאה בקריאת טאב מחלקה {tab_name}: {e}")
 
-            # 2. טעינת טאב 4: לקוחות
+            # 2. טעינת לשונית הלקוחות (עמודה A = שם, עמודה B = טלפון)
             contacts_tabs_to_try = [
-                CONTACTS_TAB_NAME, "4", "לקוחות", "אנשי קשר", 
-                "גיליון 4", "גיליון4", "Sheet4", "Sheet 4"
+                "לקוחות",
+                CONTACTS_TAB_NAME, 
+                "אנשי קשר", 
+                "4", 
+                "גיליון 4", 
+                "גיליון4", 
+                "Sheet4"
             ]
             loaded_tab_name = None
 
@@ -322,23 +326,37 @@ class SheetDataManager:
                         rows = [r for r in reader if any(cell.strip() for cell in r)]
                         
                         if rows:
-                            loaded_tab_name = c_tab
+                            temp_contacts = {}
                             for r in rows:
-                                found_phone = ""
-                                found_name = ""
+                                if len(r) < 2:
+                                    continue
+                                col_a = r[0].strip()
+                                col_b = r[1].strip()
 
-                                for cell in r:
-                                    cell_clean = cell.strip()
-                                    digits = re.sub(r'\D', '', cell_clean)
-                                    if len(digits) in [7, 8, 9, 10, 11, 12]:
-                                        found_phone = normalize_phone(digits)
-                                    elif cell_clean and not any(h in cell_clean for h in ["שם", "טלפון", "נייד", "סלולרי", "פלאפון", "מספר"]):
-                                        found_name = cell_clean
+                                # דילוג על שורת כותרת אם קיימת
+                                if col_a in ["שם", "שם לקוח", "שם מלא", "name"] or any(w in col_b for w in ["מספר", "טלפון", "נייד", "סלולרי", "פלאפון", "phone"]):
+                                    continue
 
-                                if found_phone and found_name:
-                                    new_customer_contacts[found_phone] = found_name
+                                digits_b = re.sub(r'\D', '', col_b)
+                                digits_a = re.sub(r'\D', '', col_a)
 
-                            if new_customer_contacts:
+                                # זיהוי: עמודה A שם ועמודה B טלפון (או להיפך)
+                                if len(digits_b) >= 7:
+                                    cust_name = col_a
+                                    cust_phone = normalize_phone(digits_b)
+                                elif len(digits_a) >= 7:
+                                    cust_name = col_b
+                                    cust_phone = normalize_phone(digits_a)
+                                else:
+                                    continue
+
+                                if cust_name and cust_phone:
+                                    temp_contacts[cust_phone] = cust_name
+
+                            # אם נמצאו לקוחות בטאב זה, נשמור ונסיים
+                            if temp_contacts:
+                                loaded_tab_name = c_tab
+                                new_customer_contacts = temp_contacts
                                 break
                 except Exception:
                     pass
@@ -353,8 +371,8 @@ class SheetDataManager:
 
         total_p = sum(len(v) for v in self.personal_lines.values())
         total_gen = sum(len(v) for v in self.dept_general_agents.values())
-        names_preview = list(self.customer_contacts.values())
-        root_logger.info(f"סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים, ו-{len(self.customer_contacts)} לקוחות מזוהים: {names_preview}")
+        names_list = list(self.customer_contacts.values())
+        root_logger.info(f"סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים, ו-{len(self.customer_contacts)} לקוחות נטענו מלשונית '{loaded_tab_name or 'לקוחות'}': {names_list}")
 
 
 sheet_data = SheetDataManager(GOOGLE_SHEET_URL)
@@ -676,7 +694,7 @@ async def yemot_router(request: Request):
     if not call_id:
         return Response("id_list_message=t-מזהה שיחה חסר&go_to_folder=..", media_type="text/plain; charset=utf-8")
 
-    # 2. מניעת חזרה לתור: העברה ישירה לחדר
+    # 2. מניעת חזרה לתור
     if call_id in manager.waiting_destinations or call_id in manager.transferred_calls:
         destination = manager.waiting_destinations.get(call_id) or manager.transferred_calls.get(call_id)
         if call_id in manager.waiting_events:
@@ -685,7 +703,7 @@ async def yemot_router(request: Request):
         return Response(f"id_list_message=t-מעביר אותך לשיחה&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 3. מקש 0 בעת שמיעת הקלטות / שלוחה 30: השמעת פרטים מדויקת
+    # 3. מקש 0 בעת שמיעת הקלטות / שלוחה 30: השמעת פרטים
     # ==============================================================
     sub_ext_raw = api_extension
     if BASE_FOLDER and sub_ext_raw.startswith(f"{BASE_FOLDER}/"):
@@ -847,7 +865,7 @@ async def yemot_router(request: Request):
     if len(manager.waiting_calls) == 0:
         await sheet_data.reload_from_sheets()
 
-    # חילוץ מזהה המחלקה ישירות מנתיב החיוג! (לדוגמה: 1/3 -> מחלקה 1)
+    # חילוץ מזהה המחלקה ישירות מנתיב השלוחה
     dept_id = None
     sub_ext_parts = sub_ext.split("/")
     if len(sub_ext_parts) >= 2 and sub_ext_parts[0] in ["1", "2", "3"]:
@@ -860,11 +878,10 @@ async def yemot_router(request: Request):
     transfer_msg = "מעביר אותך לשיחה עם נציג"
     is_anon = False
 
-    # בדיקה מול הגדרות המחלקה הספציפית
+    target_dept_id = dept_id or "1"
     possible_keys = [sub_ext, sub_ext_parts[-1]]
 
     # 1. בדיקת קו אישי
-    target_dept_id = dept_id or "1"
     dept_personal = sheet_data.personal_lines.get(target_dept_id, {})
     p_info = None
     for k in possible_keys:
@@ -896,7 +913,6 @@ async def yemot_router(request: Request):
         dept_id = target_dept_id
         transfer_msg = "מעביר אותך לשיחה עם נציג"
 
-    # ברירת מחדל אם השלוחה תחת מחלקה מזוהה
     elif dept_id in ["1", "2", "3"]:
         queue_type = "general"
         transfer_msg = "מעביר אותך לשיחה עם נציג"
@@ -905,6 +921,7 @@ async def yemot_router(request: Request):
         root_logger.warning(f"שלוחה {api_extension} לא מוגדרת בשיטס (טלפון מאזין: {caller_phone})")
         return Response("id_list_message=t-שלוחה לא מוגדרת בשיטס&go_to_folder=..", media_type="text/plain; charset=utf-8")
 
+    # זיהוי שם לקוח מטאב הלקוחות
     customer_name = sheet_data.customer_contacts.get(caller_phone, "")
 
     # כניסה ראשונית של המאזין לתור
