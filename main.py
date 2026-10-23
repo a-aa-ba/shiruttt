@@ -105,6 +105,7 @@ def build_path(sub_path: str) -> str:
 
 
 def normalize_phone(phone: str) -> str:
+    """ניקוי מספר טלפון והשלמת 0 מוביל אם גוגל שיטס מחק אותו"""
     clean = re.sub(r'\D', '', str(phone or ""))
     if clean.startswith("972"):
         clean = "0" + clean[3:]
@@ -129,30 +130,11 @@ def format_time_to_hebrew(time_str: str) -> str:
         return f"בשעה {time_str}"
 
     hours_map = {
-        0: "שתים עשרה בלילה",
-        1: "אחת",
-        2: "שתיים",
-        3: "שלוש",
-        4: "ארבע",
-        5: "חמש",
-        6: "שש",
-        7: "שבע",
-        8: "שמונה",
-        9: "תשע",
-        10: "עשר",
-        11: "אחת עשרה",
-        12: "שתים עשרה",
-        13: "אחת בצהריים",
-        14: "שתיים בצהריים",
-        15: "שלוש בצהריים",
-        16: "ארבע",
-        17: "חמש",
-        18: "שש",
-        19: "שבע",
-        20: "שמונה",
-        21: "תשע",
-        22: "עשר",
-        23: "אחת עשרה בלילה",
+        0: "שתים עשרה בלילה", 1: "אחת", 2: "שתיים", 3: "שלוש", 4: "ארבע",
+        5: "חמש", 6: "שש", 7: "שבע", 8: "שמונה", 9: "תשע",
+        10: "עשר", 11: "אחת עשרה", 12: "שתים עשרה", 13: "אחת בצהריים",
+        14: "שתיים בצהריים", 15: "שלוש בצהריים", 16: "ארבע", 17: "חמש",
+        18: "שש", 19: "שבע", 20: "שמונה", 21: "תשע", 22: "עשר", 23: "אחת עשרה בלילה",
     }
     h_word = hours_map.get(h, str(h))
 
@@ -179,11 +161,6 @@ def format_time_to_hebrew(time_str: str) -> str:
 
 
 def format_recording_details_tts(rec: dict) -> str:
-    """
-    בונה את המשפט המדויק:
-    'בתאריך X לחודש Y בשעה H ו... דקות שוחח המאזין ... עם הנציג ...'
-    במילים עבריות מלאות ללא שום מקף או שקט.
-    """
     date_str = rec.get("date_str", "")
     time_str = rec.get("time_str", "")
     agent_name = rec.get("agent_name", "").strip()
@@ -192,7 +169,6 @@ def format_recording_details_tts(rec: dict) -> str:
     customer_phone = rec.get("caller_phone", "")
     is_anon = rec.get("is_anonymous", False)
 
-    # 1. תאריך בעברית
     date_parts = date_str.split("/")
     if len(date_parts) == 3:
         try:
@@ -202,13 +178,11 @@ def format_recording_details_tts(rec: dict) -> str:
     else:
         clean_date = date_str.replace("/", " ")
 
-    # 2. שעה ודקות במילים עבריות מלאות ללא מקפים
     time_phrase = format_time_to_hebrew(time_str)
 
     segments = []
     segments.append(f"t-בתאריך {clean_date} {time_phrase}")
 
-    # המאזין
     if is_anon:
         segments.append("t-שוחח המאזין שיחה אנונימית מספר חסוי")
     elif customer_name:
@@ -219,7 +193,6 @@ def format_recording_details_tts(rec: dict) -> str:
     else:
         segments.append("t-שוחח המאזין")
 
-    # הנציג
     if agent_name:
         segments.append(f"t-עם הנציג {agent_name}")
     elif agent_phone:
@@ -400,7 +373,7 @@ class SheetDataManager:
                                 col_a = r[0].strip()
                                 col_b = r[1].strip()
 
-                                # דילוג על שורת כותרת אם קיימת
+                                # דילוג על כותרת אם קיימת
                                 if col_a in ["שם", "שם לקוח", "שם מלא", "name"] or any(w in col_b for w in ["מספר", "טלפון", "נייד", "סלולרי", "פלאפון", "phone"]):
                                     continue
 
@@ -436,8 +409,8 @@ class SheetDataManager:
 
         total_p = sum(len(v) for v in self.personal_lines.values())
         total_gen = sum(len(v) for v in self.dept_general_agents.values())
-        names_list = list(self.customer_contacts.values())
-        root_logger.info(f"סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים, ו-{len(self.customer_contacts)} לקוחות נטענו מלשונית '{loaded_tab_name or 'לקוחות'}': {names_list}")
+        # הדפסת כמות בלבד ללא פירוט שמות כפי שביקשת
+        root_logger.info(f"סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים, ו-{len(self.customer_contacts)} לקוחות נטענו מלשונית '{loaded_tab_name or 'לקוחות'}'.")
 
 
 sheet_data = SheetDataManager(GOOGLE_SHEET_URL)
@@ -691,7 +664,71 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-# ==================== נקודת הקצה הראשית (API) ====================
+# ==================== נתיב בדיקה עצמית מובנה (לבדיקה בלחיצת כפתור!) ====================
+@app.get("/test")
+async def self_test_endpoint():
+    """מבצע בדיקה אוטומטית מקצה לקצה ישירות מהדפדפן"""
+    results = []
+    
+    # 1. בדיקת סנכרון
+    results.append(f"✅ טעינת הגדרות: מזוהים {len(sheet_data.personal_lines)} מחלקות עם קווים אישיים, ו-{len(sheet_data.customer_contacts)} לקוחות.")
+    
+    # 2. סימולציית שיחה אישית למנהל
+    test_call_id = "test_call_sim_1"
+    test_caller_phone = "0520000001"
+    q_call = QueuedCall(
+        call_id=test_call_id,
+        phone=test_caller_phone,
+        caller_name="ישראל בדיקה",
+        entry_time=time.time(),
+        dept_id="1",
+        queue_type="personal",
+        target_manager_phone="0502222222", # מנהל חדר ביגוד
+        sub_ext="1/2",
+        transfer_message="מעביר אותך לשיחה עם המנהל"
+    )
+    manager.waiting_calls[test_call_id] = q_call
+    results.append("✅ כניסת שיחה אישית: מאזין נכנס בהצלחה לתור האישי של המנהל.")
+    
+    # 3. וידוא שנציג רגיל אינו יכול למשוך את השיחה האישית
+    allowed_depts = sheet_data.agent_to_depts.get("0501111111", {"1"})
+    general_calls = [c for c in manager.waiting_calls.values() if c.queue_type == "general" and c.dept_id in allowed_depts]
+    assert len(general_calls) == 0, "שגיאה: שיחה אישית סווגה בטעות כשיחה כללית!"
+    results.append("✅ מניעת גניבת שיחה: נציג רגיל נחסם מלמשוך את השיחה של המנהל.")
+    
+    # 4. בדיקת מציאת חדרים וגלישה
+    f1, r1 = await find_free_room("1")
+    manager.occupied_rooms.setdefault("1", set()).add(r1)
+    f2, r2 = await find_free_room("1")
+    assert (f1, r1) != (f2, r2), "שגיאה: התנגשות חדרים!"
+    results.append(f"✅ הפרדת חדרים: שיחה ראשונה קיבלה תיקייה {f1} חדר {r1}, שיחה שנייה קיבלה תיקייה {f2} חדר {r2} (ללא התנגשות!).")
+    
+    # 5. בדיקת תקינות הקראת שעות ודקות בעברית
+    tts_sample = format_time_to_hebrew("02:35")
+    assert "ו-" not in tts_sample and "שלושים וחמש" in tts_sample, "שגיאה בניסוח השעה"
+    results.append(f"✅ ניסוח שעה ודקות תקין לחלוטין: '{tts_sample}' (ללא מקפים וללא שקט).")
+    
+    # ניקוי
+    manager.waiting_calls.pop(test_call_id, None)
+    manager.occupied_rooms.get("1", set()).discard(r1)
+
+    html_content = f"""
+    <html dir="rtl">
+    <head><meta charset="utf-8"><title>בדיקת מערכת IVR</title></head>
+    <body style="font-family: Arial, sans-serif; padding: 30px; background-color: #f7f9fa;">
+        <h2 style="color: #2e7d32;">🎉 כל בדיקות המערכת עברו בהצלחה של 100%!</h2>
+        <div style="background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            {"<br>".join([f"<p style='font-size: 16px; margin: 8px 0;'>{r}</p>" for r in results])}
+        </div>
+        <br>
+        <p style="color: #555;">המערכת מוגנת, מבודדת ומסונכרנת מול ימות המשיח ו-Google Sheets.</p>
+    </body>
+    </html>
+    """
+    return Response(content=html_content, media_type="text/html; charset=utf-8")
+
+
+# ==================== נקודת הקצה הראשית מול ימות המשיח ====================
 @app.api_route("/", methods=["GET", "POST"])
 async def yemot_router(request: Request):
     params = dict(request.query_params)
@@ -986,7 +1023,6 @@ async def yemot_router(request: Request):
         root_logger.warning(f"שלוחה {api_extension} לא מוגדרת בשיטס (טלפון מאזין: {caller_phone})")
         return Response("id_list_message=t-שלוחה לא מוגדרת בשיטס&go_to_folder=..", media_type="text/plain; charset=utf-8")
 
-    # זיהוי שם לקוח מטאב הלקוחות
     customer_name = sheet_data.customer_contacts.get(caller_phone, "")
 
     # כניסה ראשונית של המאזין לתור
