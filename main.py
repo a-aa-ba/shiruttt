@@ -66,7 +66,6 @@ def get_israel_now() -> datetime.datetime:
             import pytz
             return datetime.datetime.now(pytz.timezone("Asia/Jerusalem"))
         except Exception:
-            # גיבוי לאופסט שעון קיץ/חורף בישראל (+3 שעות מ-UTC)
             tz = datetime.timezone(datetime.timedelta(hours=3))
             return datetime.datetime.now(tz)
 # ==================================================================
@@ -109,14 +108,12 @@ def normalize_phone(phone: str) -> str:
     clean = re.sub(r'\D', '', str(phone or ""))
     if clean.startswith("972"):
         clean = "0" + clean[3:]
+    elif len(clean) in [8, 9] and not clean.startswith("0"):
+        clean = "0" + clean
     return clean
 
 
 def format_recording_details_tts(rec: dict) -> str:
-    """
-    בונה את המשפט המדויק ללא שום שקט וללא שגיאות:
-    'בתאריך X לחודש Y בשעה H ו-M דקות שוחח המאזין ... עם הנציג ...'
-    """
     date_str = rec.get("date_str", "")
     time_str = rec.get("time_str", "")
     agent_name = rec.get("agent_name", "").strip()
@@ -125,14 +122,12 @@ def format_recording_details_tts(rec: dict) -> str:
     customer_phone = rec.get("caller_phone", "")
     is_anon = rec.get("is_anonymous", False)
 
-    # 1. תאריך בעברית נקייה ללא לוכסנים
     date_parts = date_str.split("/")
     if len(date_parts) == 3:
         clean_date = f"{int(date_parts[0])} לחודש {int(date_parts[1])}"
     else:
         clean_date = date_str.replace("/", " ")
 
-    # 2. שעה בעברית חלקה ללא שום אפס מוביל או מקף בודד
     time_parts = time_str.split(":")
     if len(time_parts) == 2:
         hour_int = int(time_parts[0])
@@ -147,7 +142,6 @@ def format_recording_details_tts(rec: dict) -> str:
     segments = []
     segments.append(f"t-בתאריך {clean_date} {time_phrase}")
 
-    # המאזין
     if is_anon:
         segments.append("t-שוחח המאזין שיחה אנונימית מספר חסוי")
     elif customer_name:
@@ -158,7 +152,6 @@ def format_recording_details_tts(rec: dict) -> str:
     else:
         segments.append("t-שוחח המאזין")
 
-    # הנציג
     if agent_name:
         segments.append(f"t-עם הנציג {agent_name}")
     elif agent_phone:
@@ -197,10 +190,11 @@ class SheetDataManager:
     def __init__(self, sheet_url: str):
         self.sheet_url = sheet_url
         self.spreadsheet_id = self._extract_sheet_id(sheet_url)
-        self.personal_lines: Dict[str, ManagerLineInfo] = {}
+        # מילונים מופרדים פר מחלקה: {dept_id: {sub_ext: info}}
+        self.personal_lines: Dict[str, Dict[str, ManagerLineInfo]] = {}
         self.dept_general_agents: Dict[str, Set[str]] = {}
-        self.general_queue_extensions: Dict[str, str] = {}
-        self.anonymous_queue_extensions: Dict[str, str] = {}
+        self.general_queue_extensions: Dict[str, Set[str]] = {}
+        self.anonymous_queue_extensions: Dict[str, Set[str]] = {}
         self.agent_to_depts: Dict[str, Set[str]] = {}
         self.agent_names: Dict[str, str] = {}
         self.customer_contacts: Dict[str, str] = {}
@@ -224,6 +218,7 @@ class SheetDataManager:
         new_customer_contacts = {}
 
         async with httpx.AsyncClient() as client:
+            # 1. טעינת מחלקות 1 עד 3
             for tab_name in DEPARTMENT_TABS:
                 clean_tab_name = tab_name.strip()
                 dept_id = DEPT_NAME_TO_ID.get(clean_tab_name)
@@ -249,13 +244,19 @@ class SheetDataManager:
 
                     if dept_id not in new_dept_general_agents:
                         new_dept_general_agents[dept_id] = set()
+                    if dept_id not in new_personal_lines:
+                        new_personal_lines[dept_id] = {}
+                    if dept_id not in new_general_queues:
+                        new_general_queues[dept_id] = set()
+                    if dept_id not in new_anonymous_queues:
+                        new_anonymous_queues[dept_id] = set()
 
                     for r in rows[1:]:
                         if not r or not any(r):
                             continue
                         row_dict = {headers[i]: r[i].strip() for i in range(min(len(headers), len(r)))}
 
-                        sub_ext = row_dict.get("שלוחה", "").strip("/")
+                        raw_sub = row_dict.get("שלוחה", "").strip("/")
                         name = row_dict.get("שם", "").strip()
                         phone = normalize_phone(row_dict.get("טלפון", ""))
                         
@@ -264,28 +265,38 @@ class SheetDataManager:
                         is_manager_role = "מנהל" in last_col_val or "מנהל" in row_dict.get("תפקיד", "") or "מנהל" in name
                         is_anonymous = "אנונימי" in last_col_val or "אנונימי" in row_dict.get("תפקיד", "")
 
-                        if not sub_ext or not phone:
+                        if not raw_sub or not phone:
                             continue
 
                         if name:
                             new_agent_names[phone] = name
 
+                        # שמירת השלוחה גם כפי שנכתבה וגם כספרה בודדת
+                        possible_keys = {raw_sub}
+                        if "/" in raw_sub:
+                            possible_keys.add(raw_sub.split("/")[-1])
+                        else:
+                            possible_keys.add(f"{dept_id}/{raw_sub}")
+
                         if is_personal:
-                            new_personal_lines[sub_ext] = ManagerLineInfo(
-                                name=name, 
-                                phone=phone, 
-                                dept_id=dept_id,
-                                is_manager=is_manager_role
-                            )
+                            for k in possible_keys:
+                                new_personal_lines[dept_id][k] = ManagerLineInfo(
+                                    name=name, 
+                                    phone=phone, 
+                                    dept_id=dept_id,
+                                    is_manager=is_manager_role
+                                )
                         elif is_anonymous:
                             new_dept_general_agents[dept_id].add(phone)
-                            new_anonymous_queues[sub_ext] = dept_id
+                            for k in possible_keys:
+                                new_anonymous_queues[dept_id].add(k)
                             if phone not in new_agent_to_depts:
                                 new_agent_to_depts[phone] = set()
                             new_agent_to_depts[phone].add(dept_id)
                         else:
                             new_dept_general_agents[dept_id].add(phone)
-                            new_general_queues[sub_ext] = dept_id
+                            for k in possible_keys:
+                                new_general_queues[dept_id].add(k)
                             if phone not in new_agent_to_depts:
                                 new_agent_to_depts[phone] = set()
                             new_agent_to_depts[phone].add(dept_id)
@@ -293,7 +304,13 @@ class SheetDataManager:
                 except Exception as e:
                     root_logger.warning(f"שגיאה בקריאת טאב מחלקה {tab_name}: {e}")
 
-            contacts_tabs_to_try = [CONTACTS_TAB_NAME, "4", "לקוחות", "אנשי קשר"]
+            # 2. טעינת טאב 4: לקוחות
+            contacts_tabs_to_try = [
+                CONTACTS_TAB_NAME, "4", "לקוחות", "אנשי קשר", 
+                "גיליון 4", "גיליון4", "Sheet4", "Sheet 4"
+            ]
+            loaded_tab_name = None
+
             for c_tab in contacts_tabs_to_try:
                 c_tab_encoded = urllib.parse.quote(c_tab)
                 url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={c_tab_encoded}"
@@ -302,18 +319,27 @@ class SheetDataManager:
                     if res.status_code == 200 and not res.text.strip().startswith("/*O_o*/"):
                         content = res.content.decode('utf-8-sig')
                         reader = csv.reader(io.StringIO(content))
-                        rows = list(reader)
-                        if len(rows) >= 2:
-                            headers = [h.strip() for h in rows[0]]
-                            for r in rows[1:]:
-                                if not r or not any(r):
-                                    continue
-                                row_dict = {headers[i]: r[i].strip() for i in range(min(len(headers), len(r)))}
-                                c_name = row_dict.get("שם", "") or row_dict.get("שם לקוח", "")
-                                c_phone = normalize_phone(row_dict.get("טלפון", "") or row_dict.get("טלפון לקוח", "") or row_dict.get("מספר", ""))
-                                if c_name and c_phone:
-                                    new_customer_contacts[c_phone] = c_name
-                            break
+                        rows = [r for r in reader if any(cell.strip() for cell in r)]
+                        
+                        if rows:
+                            loaded_tab_name = c_tab
+                            for r in rows:
+                                found_phone = ""
+                                found_name = ""
+
+                                for cell in r:
+                                    cell_clean = cell.strip()
+                                    digits = re.sub(r'\D', '', cell_clean)
+                                    if len(digits) in [7, 8, 9, 10, 11, 12]:
+                                        found_phone = normalize_phone(digits)
+                                    elif cell_clean and not any(h in cell_clean for h in ["שם", "טלפון", "נייד", "סלולרי", "פלאפון", "מספר"]):
+                                        found_name = cell_clean
+
+                                if found_phone and found_name:
+                                    new_customer_contacts[found_phone] = found_name
+
+                            if new_customer_contacts:
+                                break
                 except Exception:
                     pass
 
@@ -325,8 +351,10 @@ class SheetDataManager:
         self.agent_names = new_agent_names
         self.customer_contacts = new_customer_contacts
 
+        total_p = sum(len(v) for v in self.personal_lines.values())
         total_gen = sum(len(v) for v in self.dept_general_agents.values())
-        root_logger.info(f"סנכרון הושלם: {len(self.personal_lines)} קווים אישיים, {total_gen} נציגים, ו-{len(self.customer_contacts)} לקוחות מזוהים בטאב 4.")
+        names_preview = list(self.customer_contacts.values())
+        root_logger.info(f"סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים, ו-{len(self.customer_contacts)} לקוחות מזוהים: {names_preview}")
 
 
 sheet_data = SheetDataManager(GOOGLE_SHEET_URL)
@@ -677,8 +705,6 @@ async def yemot_router(request: Request):
 
     if is_ext_30 and is_key_0:
         rec = None
-        
-        # איתור שורת ההקלטה מתוך קובץ הלוג לפי שם הקובץ (למשל 001.wav)
         match_wav = re.search(r'(\d{3}\.wav)', what_file, re.IGNORECASE)
         target_wav = match_wav.group(1) if match_wav else ""
 
@@ -706,7 +732,6 @@ async def yemot_router(request: Request):
         if rec:
             tts_msg = format_recording_details_tts(rec)
             root_logger.info(f"הושמעו פרטי שיחה: {tts_msg}")
-            # חוזר מיד להמשך שמיעת ההקלטה ללא שום ניתוק!
             return Response(f"id_list_message={tts_msg}", media_type="text/plain; charset=utf-8")
         else:
             return Response("id_list_message=t-לא נמצאו פרטים על שיחה זו", media_type="text/plain; charset=utf-8")
@@ -734,7 +759,7 @@ async def yemot_router(request: Request):
                 caller_ident = selected_call.caller_name or selected_call.phone
                 root_logger.info(f"מושך שיחה אישית עבור {caller_phone} (מאזין: {caller_ident})")
 
-            # עדיxxx x: שיחה כללית
+            # עדיפות 2: שיחה כללית
             if not selected_call:
                 allowed_depts = sheet_data.agent_to_depts.get(caller_phone, set())
                 general_calls = [
@@ -766,7 +791,6 @@ async def yemot_router(request: Request):
                 if selected_call.call_id in manager.waiting_events:
                     manager.waiting_events[selected_call.call_id].set()
 
-                # תאריך ושעה מדויקים לפי שעון ישראל!
                 now_dt = get_israel_now()
                 customer_name = selected_call.caller_name or sheet_data.customer_contacts.get(selected_call.phone, "")
                 date_str = now_dt.strftime("%d/%m/%Y")
@@ -823,18 +847,35 @@ async def yemot_router(request: Request):
     if len(manager.waiting_calls) == 0:
         await sheet_data.reload_from_sheets()
 
+    # חילוץ מזהה המחלקה ישירות מנתיב החיוג! (לדוגמה: 1/3 -> מחלקה 1)
+    dept_id = None
+    sub_ext_parts = sub_ext.split("/")
+    if len(sub_ext_parts) >= 2 and sub_ext_parts[0] in ["1", "2", "3"]:
+        dept_id = sub_ext_parts[0]
+    elif sub_ext in ["1", "2", "3"]:
+        dept_id = sub_ext
+
     queue_type = None
     target_manager_phone = None
-    dept_id = None
     transfer_msg = "מעביר אותך לשיחה עם נציג"
     is_anon = False
 
-    if sub_ext in sheet_data.personal_lines:
-        p_info = sheet_data.personal_lines[sub_ext]
+    # בדיקה מול הגדרות המחלקה הספציפית
+    possible_keys = [sub_ext, sub_ext_parts[-1]]
+
+    # 1. בדיקת קו אישי
+    target_dept_id = dept_id or "1"
+    dept_personal = sheet_data.personal_lines.get(target_dept_id, {})
+    p_info = None
+    for k in possible_keys:
+        if k in dept_personal:
+            p_info = dept_personal[k]
+            break
+
+    if p_info:
         queue_type = "personal"
         target_manager_phone = p_info.phone
         dept_id = p_info.dept_id
-        
         if p_info.is_manager:
             transfer_msg = "מעביר אותך לשיחה עם המנהל"
         elif p_info.name:
@@ -842,18 +883,25 @@ async def yemot_router(request: Request):
         else:
             transfer_msg = "מעביר אותך לשיחה עם נציג"
 
-    elif sub_ext in sheet_data.anonymous_queue_extensions:
-        dept_id = sheet_data.anonymous_queue_extensions[sub_ext]
+    # 2. בדיקת תור אנונימי
+    elif any(k in sheet_data.anonymous_queue_extensions.get(target_dept_id, set()) for k in possible_keys):
         queue_type = "general"
+        dept_id = target_dept_id
         transfer_msg = "מעביר אותך למענה אנונימי"
         is_anon = True
 
-    elif sub_ext in sheet_data.general_queue_extensions:
-        dept_id = sheet_data.general_queue_extensions[sub_ext]
+    # 3. בדיקת תור כללי
+    elif any(k in sheet_data.general_queue_extensions.get(target_dept_id, set()) for k in possible_keys):
+        queue_type = "general"
+        dept_id = target_dept_id
+        transfer_msg = "מעביר אותך לשיחה עם נציג"
+
+    # ברירת מחדל אם השלוחה תחת מחלקה מזוהה
+    elif dept_id in ["1", "2", "3"]:
         queue_type = "general"
         transfer_msg = "מעביר אותך לשיחה עם נציג"
 
-    if not queue_type:
+    if not queue_type or not dept_id:
         root_logger.warning(f"שלוחה {api_extension} לא מוגדרת בשיטס (טלפון מאזין: {caller_phone})")
         return Response("id_list_message=t-שלוחה לא מוגדרת בשיטס&go_to_folder=..", media_type="text/plain; charset=utf-8")
 
