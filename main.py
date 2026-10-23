@@ -55,6 +55,23 @@ GRACE_PERIOD = WAIT_TIMEOUT + 30
 # ============================================================
 
 
+# ==================== פונקציית שעון ישראל מדויק ====================
+def get_israel_now() -> datetime.datetime:
+    """מחזיר תמיד את התאריך והשעה הנוכחיים של ישראל (למניעת שגיאת UTC)"""
+    try:
+        import zoneinfo
+        return datetime.datetime.now(zoneinfo.ZoneInfo("Asia/Jerusalem"))
+    except Exception:
+        try:
+            import pytz
+            return datetime.datetime.now(pytz.timezone("Asia/Jerusalem"))
+        except Exception:
+            # גיבוי לאופסט שעון קיץ/חורף בישראל (+3 שעות מ-UTC)
+            tz = datetime.timezone(datetime.timedelta(hours=3))
+            return datetime.datetime.now(tz)
+# ==================================================================
+
+
 # ==================== הגדרת לוג נקי ומתומצת ====================
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -97,9 +114,8 @@ def normalize_phone(phone: str) -> str:
 
 def format_recording_details_tts(rec: dict) -> str:
     """
-    בונה את המשפט המדויק:
-    'בתאריך XXX בשעה XXX שוחח המאזין (שם או טלפון) עם הנציג (שם או טלפון)'
-    בתחביר תקין של מנוע ה-TTS בימות המשיח, ללא שגיאות.
+    בונה את המשפט המדויק ללא שום שקט וללא שגיאות:
+    'בתאריך X לחודש Y בשעה H ו-M דקות שוחח המאזין ... עם הנציג ...'
     """
     date_str = rec.get("date_str", "")
     time_str = rec.get("time_str", "")
@@ -109,12 +125,27 @@ def format_recording_details_tts(rec: dict) -> str:
     customer_phone = rec.get("caller_phone", "")
     is_anon = rec.get("is_anonymous", False)
 
-    # פירוק תאריך ושעה לטקסט זורם
-    clean_date = date_str.replace("/", " ")
-    clean_time = time_str.replace(":", " ו-")
+    # 1. תאריך בעברית נקייה ללא לוכסנים
+    date_parts = date_str.split("/")
+    if len(date_parts) == 3:
+        clean_date = f"{int(date_parts[0])} לחודש {int(date_parts[1])}"
+    else:
+        clean_date = date_str.replace("/", " ")
+
+    # 2. שעה בעברית חלקה ללא שום אפס מוביל או מקף בודד
+    time_parts = time_str.split(":")
+    if len(time_parts) == 2:
+        hour_int = int(time_parts[0])
+        min_int = int(time_parts[1])
+        if min_int == 0:
+            time_phrase = f"בשעה {hour_int} בדיוק"
+        else:
+            time_phrase = f"בשעה {hour_int} ו-{min_int} דקות"
+    else:
+        time_phrase = f"בשעה {time_str}"
 
     segments = []
-    segments.append(f"t-בתאריך {clean_date} בשעה {clean_time}")
+    segments.append(f"t-בתאריך {clean_date} {time_phrase}")
 
     # המאזין
     if is_anon:
@@ -193,7 +224,6 @@ class SheetDataManager:
         new_customer_contacts = {}
 
         async with httpx.AsyncClient() as client:
-            # טעינת מחלקות 1-3
             for tab_name in DEPARTMENT_TABS:
                 clean_tab_name = tab_name.strip()
                 dept_id = DEPT_NAME_TO_ID.get(clean_tab_name)
@@ -263,7 +293,6 @@ class SheetDataManager:
                 except Exception as e:
                     root_logger.warning(f"שגיאה בקריאת טאב מחלקה {tab_name}: {e}")
 
-            # טעינת טאב 4 לקוחות
             contacts_tabs_to_try = [CONTACTS_TAB_NAME, "4", "לקוחות", "אנשי קשר"]
             for c_tab in contacts_tabs_to_try:
                 c_tab_encoded = urllib.parse.quote(c_tab)
@@ -628,13 +657,12 @@ async def yemot_router(request: Request):
         return Response(f"id_list_message=t-מעביר אותך לשיחה&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 3. מקש 0 בעת שמיעת הקלטות / שלוחה 30: השמעת פרטים וחזרה להקלטה!
+    # 3. מקש 0 בעת שמיעת הקלטות / שלוחה 30: השמעת פרטים מדויקת
     # ==============================================================
     sub_ext_raw = api_extension
     if BASE_FOLDER and sub_ext_raw.startswith(f"{BASE_FOLDER}/"):
         sub_ext_raw = sub_ext_raw[len(BASE_FOLDER) + 1:]
 
-    # בדיקת מקש 0: נשלח כ-PressKey ממודול playfile או digits/data
     pressed_key = params.get("PressKey") or params.get("digits") or params.get("data") or params.get("key") or ""
     is_key_0 = pressed_key == "0" or api_extension.endswith("/0")
     what_file = params.get("what") or params.get("file") or params.get("filename") or ""
@@ -650,7 +678,7 @@ async def yemot_router(request: Request):
     if is_ext_30 and is_key_0:
         rec = None
         
-        # 1. ניסיון איתור לפי שם הקובץ המושמע (מהפרמטר what של playfile, למשל 001.wav)
+        # איתור שורת ההקלטה מתוך קובץ הלוג לפי שם הקובץ (למשל 001.wav)
         match_wav = re.search(r'(\d{3}\.wav)', what_file, re.IGNORECASE)
         target_wav = match_wav.group(1) if match_wav else ""
 
@@ -672,14 +700,13 @@ async def yemot_router(request: Request):
                             }
                             break
 
-        # 2. גיבוי: שליפה לפי מזהה השיחה או טלפון המאזין
         if not rec:
             rec = manager.call_history.get(call_id) or manager.last_call_by_phone.get(caller_phone)
 
         if rec:
             tts_msg = format_recording_details_tts(rec)
             root_logger.info(f"הושמעו פרטי שיחה: {tts_msg}")
-            # ללא go_to_folder=hangup - ימות המשיח חוזרת מיד להמשך שמיעת ההקלטה!
+            # חוזר מיד להמשך שמיעת ההקלטה ללא שום ניתוק!
             return Response(f"id_list_message={tts_msg}", media_type="text/plain; charset=utf-8")
         else:
             return Response("id_list_message=t-לא נמצאו פרטים על שיחה זו", media_type="text/plain; charset=utf-8")
@@ -707,7 +734,7 @@ async def yemot_router(request: Request):
                 caller_ident = selected_call.caller_name or selected_call.phone
                 root_logger.info(f"מושך שיחה אישית עבור {caller_phone} (מאזין: {caller_ident})")
 
-            # עדיפות 2: שיחה כללית
+            # עדיxxx x: שיחה כללית
             if not selected_call:
                 allowed_depts = sheet_data.agent_to_depts.get(caller_phone, set())
                 general_calls = [
@@ -739,7 +766,8 @@ async def yemot_router(request: Request):
                 if selected_call.call_id in manager.waiting_events:
                     manager.waiting_events[selected_call.call_id].set()
 
-                now_dt = datetime.datetime.now()
+                # תאריך ושעה מדויקים לפי שעון ישראל!
+                now_dt = get_israel_now()
                 customer_name = selected_call.caller_name or sheet_data.customer_contacts.get(selected_call.phone, "")
                 date_str = now_dt.strftime("%d/%m/%Y")
                 time_str = now_dt.strftime("%H:%M")
@@ -762,7 +790,7 @@ async def yemot_router(request: Request):
                 manager.call_history[selected_call.call_id] = call_record
                 manager.last_call_by_phone[selected_call.phone] = call_record
 
-                # עדכון הלוג ב-30
+                # עדכון הלוג בשלוחה 30
                 asyncio.create_task(
                     append_to_yemot_log(
                         caller_phone=selected_call.phone,
