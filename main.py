@@ -23,8 +23,16 @@ BASE_FOLDER = ""
 # שם התיקייה בשלוחה הראשית שבה נמצאים החדרים:
 ROOMS_ROOT_FOLDER = "rooms"
 
-# נתיב קובץ הלוג בשלוחה 30 מהתפריט הראשי:
+# נתיבי קבצי מערכת בימות המשיח:
 YEMOT_LOG_FILE_PATH = "ivr2:30/Log.ini"
+YEMOT_TRACKER_FILE_PATH = "ivr2:30/messages_tracker.ini"
+
+# ==== הגדרת שלוחות ההודעות למחלקות (לסריקת הודעות חדשות) ====
+DEPT_MESSAGES_EXTENSIONS = {
+    "1": "1/0/2",  # מחלקה 1 סורקת את שלוחה 00/1/8
+    "2": "2/0/2",  # מחלקה 2 סורקת את שלוחה 00/2/8
+    "3": "4/0/1",  # מחלקה 3 סורקת את שלוחה 00/3/8
+}
 
 # קישור השיתוף לגיליון גוגל שיטס:
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1LsV4NcF0C62RGo002J1tdtIG1OhDZAHcCKj6QLnNGJk/edit?usp=sharing"
@@ -32,8 +40,8 @@ GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1LsV4NcF0C62RGo002J1t
 # שמות הגליונות ב-Google Sheets
 DEPARTMENT_TABS = ["1", "2", "3"]
 
-# שם הגליון הרביעי של הלקוחות/אנשי קשר
-CONTACTS_TAB_NAME = "4"
+# שם לשונית הלקוחות (השרת יבדוק קודם כל "לקוחות")
+CONTACTS_TAB_NAME = "לקוחות"
 
 # מיפוי שמות מחלקות לתיקיות החדרים (1, 2, 3)
 DEPT_NAME_TO_ID = {
@@ -105,6 +113,7 @@ def build_path(sub_path: str) -> str:
 
 
 def normalize_phone(phone: str) -> str:
+    """ניקוי מספר טלפון והשלמת 0 מוביל אם גוגל שיטס מחק אותו"""
     clean = re.sub(r'\D', '', str(phone or ""))
     if clean.startswith("972"):
         clean = "0" + clean[3:]
@@ -116,6 +125,7 @@ def normalize_phone(phone: str) -> str:
 def format_time_to_hebrew(time_str: str) -> str:
     """
     ממירה מחרוזת שעה (HH:MM) למילים עבריות תקניות ללא מקפים (למניעת השתקת ה-TTS).
+    דוגמה: 02:35 -> בשעה שתיים ושלושים וחמש דקות
     """
     parts = time_str.split(":")
     if len(parts) != 2:
@@ -161,8 +171,8 @@ def format_time_to_hebrew(time_str: str) -> str:
 def format_recording_details_tts(rec: dict) -> str:
     """
     בונה את המשפט המדויק:
-    'בתאריך XXX בשעה XXX שוחח המאזין (שם או טלפון) עם הנציג (שם או טלפון)'
-    בתחביר תקין של מנוע ה-TTS בימות המשיח, ללא שגיאות.
+    'בתאריך X לחודש Y בשעה H ו-M דקות שוחח המאזין ... עם הנציג ...'
+    במילים עבריות מלאות ללא שום מקף או שקט.
     """
     date_str = rec.get("date_str", "")
     time_str = rec.get("time_str", "")
@@ -186,7 +196,6 @@ def format_recording_details_tts(rec: dict) -> str:
     segments = []
     segments.append(f"t-בתאריך {clean_date} {time_phrase}")
 
-    # המאזין
     if is_anon:
         segments.append("t-שוחח המאזין שיחה אנונימית מספר חסוי")
     elif customer_name:
@@ -197,7 +206,6 @@ def format_recording_details_tts(rec: dict) -> str:
     else:
         segments.append("t-שוחח המאזין")
 
-    # הנציג
     if agent_name:
         segments.append(f"t-עם הנציג {agent_name}")
     elif agent_phone:
@@ -217,8 +225,8 @@ class QueuedCall:
     caller_name: str
     entry_time: float
     dept_id: str
-    queue_type: str                         # "general" או "personal"
-    target_manager_phone: Optional[str]     # רלוונטי לשיחה אישית
+    queue_type: str                         
+    target_manager_phone: Optional[str]     
     sub_ext: str
     transfer_message: str = "מעביר אותך לשיחה עם נציג"
     is_anonymous: bool = False
@@ -240,13 +248,16 @@ class SheetDataManager:
         self.dept_general_agents: Dict[str, Set[str]] = {}
         self.general_queue_extensions: Dict[str, Set[str]] = {}
         self.anonymous_queue_extensions: Dict[str, Set[str]] = {}
+        self.dept_messages_extension: Dict[str, str] = {}  # שמירת שלוחת הודעות
         self.agent_to_depts: Dict[str, Set[str]] = {}
         self.agent_names: Dict[str, str] = {}
         self.customer_contacts: Dict[str, str] = {}
 
     def _extract_sheet_id(self, url: str) -> str:
         match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
-        return match.group(1) if match else ""
+        if match:
+            return match.group(1)
+        return ""
 
     async def reload_from_sheets(self):
         if not self.spreadsheet_id:
@@ -258,6 +269,7 @@ class SheetDataManager:
         new_dept_general_agents = {}
         new_general_queues = {}
         new_anonymous_queues = {}
+        new_dept_messages_ext = {}
         new_agent_to_depts = {}
         new_agent_names = {}
         new_customer_contacts = {}
@@ -296,16 +308,23 @@ class SheetDataManager:
                     if dept_id not in new_anonymous_queues:
                         new_anonymous_queues[dept_id] = set()
 
+                    # הגדרת ברירת מחדל לשלוחת הודעות לפי מה שהוגדר למעלה
+                    new_dept_messages_ext[dept_id] = DEPT_MESSAGES_EXTENSIONS.get(dept_id, f"{dept_id}/8")
+
                     for r in rows[1:]:
                         if not r or not any(r):
                             continue
-                        
                         row_dict = {headers[i]: r[i].strip() for i in range(min(len(headers), len(r)))}
 
                         raw_sub = row_dict.get("שלוחה", "").strip("/")
                         name = row_dict.get("שם", "").strip()
                         phone = normalize_phone(row_dict.get("טלפון", ""))
                         
+                        # דריסת שלוחת ההודעות אם קיימת עמודה כזו בשיטס!
+                        custom_msg_ext = row_dict.get("שלוחת הודעות", "").strip("/")
+                        if custom_msg_ext:
+                            new_dept_messages_ext[dept_id] = custom_msg_ext
+
                         last_col_val = r[-1].strip() if r else ""
                         is_personal = "אישי" in last_col_val or row_dict.get("תפקיד", "") == "אישי"
                         is_manager_role = "מנהל" in last_col_val or "מנהל" in row_dict.get("תפקיד", "") or "מנהל" in name
@@ -347,9 +366,9 @@ class SheetDataManager:
                             new_agent_to_depts[phone].add(dept_id)
 
                 except Exception as e:
-                    root_logger.warning(f"שגיאה בקריאת טאב מחלקה {tab_name}: {e}")
+                    root_logger.warning(f"שגיאה בקריאת מחלקה {tab_name}: {e}")
 
-            # 2. טעינת לשונית הלקוחות
+            # 2. טעינת טאב 4: לקוחות
             contacts_tabs_to_try = [
                 "לקוחות",
                 CONTACTS_TAB_NAME, 
@@ -408,6 +427,7 @@ class SheetDataManager:
         self.dept_general_agents = new_dept_general_agents
         self.general_queue_extensions = new_general_queues
         self.anonymous_queue_extensions = new_anonymous_queues
+        self.dept_messages_extension = new_dept_messages_ext
         self.agent_to_depts = new_agent_to_depts
         self.agent_names = new_agent_names
         self.customer_contacts = new_customer_contacts
@@ -509,6 +529,73 @@ async def append_to_yemot_log(caller_phone: str, customer_name: str, agent_phone
             root_logger.info(f"קובץ הלוג עודכן: {new_entry}")
     except Exception as e:
         root_logger.error(f"שגיאה ברישום לוג בימות המשיח: {e}")
+
+
+async def get_agent_last_heard_file(agent_phone: str) -> str:
+    """קורא מקובץ המעקב בימות המשיח מהו הקובץ האחרון שהנציג שמע"""
+    try:
+        res = await yemot_api_request("GetTextFile", params={"what": YEMOT_TRACKER_FILE_PATH}, timeout=3.0)
+        if res and res.get("responseStatus") == "OK":
+            for line in res.get("contents", "").splitlines():
+                if line.startswith(f"{agent_phone}="):
+                    return line.split("=")[-1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+async def save_agent_last_heard_file(agent_phone: str, latest_file: str):
+    """שומר בענן ימות המשיח את שם הקובץ האחרון שהנציג שמע"""
+    try:
+        res = await yemot_api_request("GetTextFile", params={"what": YEMOT_TRACKER_FILE_PATH}, timeout=3.0)
+        lines = []
+        if res and res.get("responseStatus") == "OK":
+            lines = [l.strip() for l in res.get("contents", "").splitlines() if l.strip() and not l.startswith(f"{agent_phone}=")]
+        
+        lines.append(f"{agent_phone}={latest_file}")
+        
+        await yemot_api_request(
+            "UploadTextFile", 
+            method="POST", 
+            data={
+                "what": YEMOT_TRACKER_FILE_PATH, 
+                "contents": "\n".join(lines) + "\n"
+            }, 
+            timeout=4.0
+        )
+    except Exception:
+        pass
+
+
+async def check_new_messages_for_agent(agent_phone: str) -> Tuple[bool, str, str]:
+    """סורק את שלוחת ההודעות מול ה-API לבדוק האם התווסף קובץ חדש"""
+    allowed_depts = sheet_data.agent_to_depts.get(agent_phone, set())
+    for d_id, dept_dict in sheet_data.personal_lines.items():
+        for info in dept_dict.values():
+            if info.phone == agent_phone:
+                allowed_depts.add(d_id)
+
+    if not allowed_depts:
+        return False, "", ""
+
+    dept_id = list(allowed_depts)[0]
+    msg_sub_ext = sheet_data.dept_messages_extension.get(dept_id, f"{dept_id}/8")
+    msg_ext_full = build_path(msg_sub_ext)
+
+    res = await yemot_api_request("GetIVR2Dir", params={"path": f"ivr2:{msg_ext_full}"}, timeout=3.0)
+    if not res or res.get("responseStatus") != "OK":
+        return False, msg_ext_full, ""
+
+    wav_files = sorted([f.get("name") for f in res.get("files", []) if f.get("name", "").lower().endswith(".wav") and not f.get("name", "").startswith(".")])
+    if not wav_files:
+        return False, msg_ext_full, ""
+
+    latest_file = wav_files[-1]
+    last_heard = await get_agent_last_heard_file(agent_phone)
+    if latest_file > last_heard:
+        return True, msg_ext_full, latest_file
+
+    return False, msg_ext_full, latest_file
 
 
 async def get_active_calls():
@@ -668,7 +755,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-# ==================== נתיב בדיקה עצמית לשרת ====================
+# ==================== נתיב בדיקה עצמית לשרת (Test Endpoint) ====================
 @app.get("/test")
 async def self_test_endpoint():
     """מבצע בדיקה אוטומטית מקצה לקצה ישירות מהדפדפן"""
@@ -694,14 +781,18 @@ async def self_test_endpoint():
     
     allowed_depts = sheet_data.agent_to_depts.get("0501111111", {"1"})
     general_calls = [c for c in manager.waiting_calls.values() if c.queue_type == "general" and c.dept_id in allowed_depts]
-    assert len(general_calls) == 0, "שגיאה: שיחה אישית סווגה בטעות כשיחה כללית!"
-    results.append("✅ מניעת גניבת שיחה: נציג רגיל נחסם מלמשוך את השיחה של המנהל.")
+    if len(general_calls) == 0:
+        results.append("✅ מניעת גניבת שיחה: נציג רגיל נחסם מלמשוך את השיחה של המנהל.")
+    else:
+        results.append("❌ שגיאה: שיחה אישית סווגה בטעות כשיחה כללית!")
     
     f1, r1 = await find_free_room("1")
     manager.occupied_rooms.setdefault("1", set()).add(r1)
     f2, r2 = await find_free_room("1")
-    assert (f1, r1) != (f2, r2), "שגיאה: התנגשות חדרים!"
-    results.append(f"✅ הפרדת חדרים: שיחה ראשונה קיבלה תיקייה {f1} חדר {r1}, שיחה שנייה קיבלה תיקייה {f2} חדר {r2} (ללא התנגשות!).")
+    if (f1, r1) != (f2, r2):
+        results.append(f"✅ הפרדת חדרים: שיחה ראשונה קיבלה תיקייה {f1} חדר {r1}, שיחה שנייה קיבלה תיקייה {f2} חדר {r2} (ללא התנגשות!).")
+    else:
+        results.append("❌ שגיאה: התנגשות חדרים!")
     
     manager.waiting_calls.pop(test_call_id, None)
     manager.occupied_rooms.get("1", set()).discard(r1)
@@ -710,7 +801,7 @@ async def self_test_endpoint():
     <html dir="rtl">
     <head><meta charset="utf-8"><title>בדיקת מערכת IVR</title></head>
     <body style="font-family: Arial, sans-serif; padding: 30px; background-color: #f7f9fa;">
-        <h2 style="color: #2e7d32;">🎉 כל בדיקות המערכת עברו בהצלחה של 100%!</h2>
+        <h2 style="color: #2e7d32;">🎉 כל בדיקות המערכת הסתיימו!</h2>
         <div style="background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
             {"<br>".join([f"<p style='font-size: 16px; margin: 8px 0;'>{r}</p>" for r in results])}
         </div>
@@ -797,7 +888,63 @@ async def yemot_router(request: Request):
         return Response(f"id_list_message=t-מעביר אותך לשיחה&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 3. מקש 0 בעת שמיעת הקלטות / שלוחה 30: השמעת פרטים מלאה וחזרה להקלטה
+    # 3. שלוחת הניתוב החכמה לנציגים (שלוחה 10) - תור והודעות
+    # ==============================================================
+    gateway_ext = build_path("10")
+    if api_extension == gateway_ext or api_extension == "10":
+        
+        is_agent = caller_phone in sheet_data.agent_names or caller_phone in sheet_data.agent_to_depts
+        if not is_agent:
+            for dept_dict in sheet_data.personal_lines.values():
+                for info in dept_dict.values():
+                    if info.phone == caller_phone:
+                        is_agent = True
+                        break
+
+        if not is_agent:
+            return Response(f"go_to_folder=/{BASE_FOLDER}", media_type="text/plain; charset=utf-8")
+
+        has_waiting_call = False
+        async with manager.lock:
+            if any(c.queue_type == "personal" and c.target_manager_phone == caller_phone for c in manager.waiting_calls.values()):
+                has_waiting_call = True
+            else:
+                allowed_depts = sheet_data.agent_to_depts.get(caller_phone, set())
+                if any(c.queue_type == "general" and c.dept_id in allowed_depts for c in manager.waiting_calls.values()):
+                    has_waiting_call = True
+
+        has_new_msg, msg_ext_full, latest_wav = await check_new_messages_for_agent(caller_phone)
+
+        pressed = params.get("digits") or params.get("data") or params.get("key") or ""
+        
+        if pressed == "1":
+            if has_waiting_call:
+                return Response(f"id_list_message=t-מעביר אותך למענה לשיחה&go_to_folder=/{build_path('20')}", media_type="text/plain; charset=utf-8")
+            elif has_new_msg:
+                asyncio.create_task(save_agent_last_heard_file(caller_phone, latest_wav))
+                return Response(f"id_list_message=t-מעביר אותך לשמיעת ההודעה&go_to_folder=/{msg_ext_full}", media_type="text/plain; charset=utf-8")
+        
+        elif pressed == "2":
+            if has_waiting_call and has_new_msg:
+                asyncio.create_task(save_agent_last_heard_file(caller_phone, latest_wav))
+                return Response(f"id_list_message=t-מעביר אותך לשמיעת ההודעה&go_to_folder=/{msg_ext_full}", media_type="text/plain; charset=utf-8")
+            else:
+                return Response(f"go_to_folder=/{BASE_FOLDER}", media_type="text/plain; charset=utf-8")
+        
+        elif pressed == "3":
+            return Response(f"go_to_folder=/{BASE_FOLDER}", media_type="text/plain; charset=utf-8")
+
+        if has_waiting_call and has_new_msg:
+            return Response("read=t-ישנה שיחה ממתינה בתור וקיימת הודעה חדשה. למענה לשיחה הקישו 1. לשמיעת ההודעה הקישו 2. לכניסה רגילה הקישו 3=digits,1,1,1,7,No,No,123", media_type="text/plain; charset=utf-8")
+        elif has_waiting_call:
+            return Response("read=t-ישנה שיחה ממתינה בתור. למענה לשיחה הקישו 1. לכניסה רגילה הקישו 2=digits,1,1,1,7,No,No,12", media_type="text/plain; charset=utf-8")
+        elif has_new_msg:
+            return Response("read=t-קיימת הודעה חדשה. לשמיעת ההודעה הקישו 1. לכניסה רגילה הקישו 2=digits,1,1,1,7,No,No,12", media_type="text/plain; charset=utf-8")
+        else:
+            return Response(f"go_to_folder=/{build_path('20')}", media_type="text/plain; charset=utf-8")
+
+    # ==============================================================
+    # 4. שלוחה 30: מקש 0 בהשמעת הקלטות וחזרה רציפה
     # ==============================================================
     sub_ext_raw = api_extension
     if BASE_FOLDER and sub_ext_raw.startswith(f"{BASE_FOLDER}/"):
@@ -845,13 +992,13 @@ async def yemot_router(request: Request):
             tts_msg = format_recording_details_tts(rec)
             root_logger.info(f"הושמעו פרטי שיחה: {tts_msg}")
             
-            # השינוי החשוב: הורדנו את go_to_folder=hangup כדי שהשלוחה תחזור להקלטה!
+            # השינוי: השמעה ללא go_to_folder=hangup, כך שימות המשיח חוזרת להמשך ההקלטה.
             return Response(f"id_list_message={tts_msg}", media_type="text/plain; charset=utf-8")
         else:
             return Response("id_list_message=t-לא נמצאו פרטים על שיחה זו", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 4. שלוחת הנציגים/מנהלים הכללית (שלוחה 00/20)
+    # 5. שלוחת הנציגים/מנהלים הכללית (שלוחה 00/20)
     # ==============================================================
     agent_full_ext = build_path("20")
     if api_extension == agent_full_ext or api_extension == "20":
@@ -862,7 +1009,6 @@ async def yemot_router(request: Request):
         async with manager.lock:
             selected_call: Optional[QueuedCall] = None
 
-            # עדיפות 1: שיחה אישית לנציג זה
             personal_calls = [
                 c for c in manager.waiting_calls.values()
                 if c.queue_type == "personal" and c.target_manager_phone == caller_phone
@@ -873,7 +1019,6 @@ async def yemot_router(request: Request):
                 caller_ident = selected_call.caller_name or selected_call.phone
                 root_logger.info(f"מושך שיחה אישית עבור {caller_phone} (מאזין: {caller_ident})")
 
-            # עדיפות 2: שיחה כללית
             if not selected_call:
                 allowed_depts = sheet_data.agent_to_depts.get(caller_phone, set())
                 general_calls = [
@@ -886,7 +1031,6 @@ async def yemot_router(request: Request):
                     caller_ident = selected_call.caller_name or selected_call.phone
                     root_logger.info(f"מושך שיחה כללית במחלקה {selected_call.dept_id} (מאזין: {caller_ident})")
 
-            # שידוך לחדר פנוי
             if selected_call:
                 chosen_folder, free_room = await find_free_room(selected_call.dept_id)
 
@@ -928,7 +1072,6 @@ async def yemot_router(request: Request):
                 manager.call_history[selected_call.call_id] = call_record
                 manager.last_call_by_phone[selected_call.phone] = call_record
 
-                # עדכון הלוג בשלוחה 30
                 asyncio.create_task(
                     append_to_yemot_log(
                         caller_phone=selected_call.phone,
@@ -952,7 +1095,7 @@ async def yemot_router(request: Request):
                 return Response(f"id_list_message=t-אין שיחות ממתינות כעת&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 5. כניסת מאזינים לתור
+    # 6. כניסת מאזינים לתור
     # ==============================================================
     sub_ext = api_extension
     if BASE_FOLDER and sub_ext.startswith(f"{BASE_FOLDER}/"):
@@ -961,7 +1104,6 @@ async def yemot_router(request: Request):
     if len(manager.waiting_calls) == 0:
         await sheet_data.reload_from_sheets()
 
-    # חילוץ מזהה המחלקה ישירות מנתיב השלוחה
     dept_id = None
     sub_ext_parts = sub_ext.split("/")
     if len(sub_ext_parts) >= 2 and sub_ext_parts[0] in ["1", "2", "3"]:
@@ -978,11 +1120,7 @@ async def yemot_router(request: Request):
     possible_keys = [sub_ext, sub_ext_parts[-1]]
 
     dept_personal = sheet_data.personal_lines.get(target_dept_id, {})
-    p_info = None
-    for k in possible_keys:
-        if k in dept_personal:
-            p_info = dept_personal[k]
-            break
+    p_info = next((dept_personal[k] for k in possible_keys if k in dept_personal), None)
 
     if p_info:
         queue_type = "personal"
@@ -1016,7 +1154,6 @@ async def yemot_router(request: Request):
 
     customer_name = sheet_data.customer_contacts.get(caller_phone, "")
 
-    # כניסה ראשונית של המאזין לתור
     async with manager.lock:
         if call_id not in manager.waiting_calls:
             q_call = QueuedCall(
@@ -1046,10 +1183,9 @@ async def yemot_router(request: Request):
                 manager.tzintuk_tasks[t_key] = asyncio.create_task(run_tzintuk_loop(t_key, phone_func))
 
             display_caller = f"{customer_name} ({caller_phone})" if customer_name else caller_phone
-            root_logger.info(f"מאזין {display_caller} נכנס לתור מחלקה {dept_id} (מיקום: {pos})")
+            root_logger.info(f"מאזין {display_caller} נכנס לתור {dept_id} (מיקום: {pos})")
             return Response(f"id_list_message=t-מיקומך בתור הוא {pos}&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
 
-    # כניסה חוזרת – המתנה רציפה
     event = asyncio.Event()
     manager.waiting_events[call_id] = event
 
