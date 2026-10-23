@@ -17,7 +17,7 @@ import re
 # ==================== הגדרות מערכת כלליות ====================
 YEMOT_API_TOKEN = "0775311511:124578"
 
-# תיקיית הבסיס של התורים והנציגים (כרגע "00")
+# תיקיית הבסיס - שלוחה ראשית (ריק)
 BASE_FOLDER = ""
 
 # שם התיקייה בשלוחה הראשית שבה נמצאים החדרים:
@@ -29,9 +29,9 @@ YEMOT_TRACKER_FILE_PATH = "ivr2:30/messages_tracker.ini"
 
 # ==== הגדרת שלוחות ההודעות למחלקות (לסריקת הודעות חדשות) ====
 DEPT_MESSAGES_EXTENSIONS = {
-    "1": "1/0/2",  # מחלקה 1 סורקת את שלוחה 00/1/8
-    "2": "2/0/2",  # מחלקה 2 סורקת את שלוחה 00/2/8
-    "3": "4/0/1",  # מחלקה 3 סורקת את שלוחה 00/3/8
+    "1": "1/0/2",  # מחלקה 1 סורקת את שלוחה 1/8
+    "2": "2/0/2",  # מחלקה 2 סורקת את שלוחה 2/8
+    "3": "4/0/1",  # מחלקה 3 סורקת את שלוחה 3/8
 }
 
 # קישור השיתוף לגיליון גוגל שיטס:
@@ -110,6 +110,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 def build_path(sub_path: str) -> str:
     sub = sub_path.strip("/")
     return f"{BASE_FOLDER}/{sub}" if BASE_FOLDER else sub
+
+
+def get_base_root_dest() -> str:
+    return f"/{BASE_FOLDER}" if BASE_FOLDER else "/"
 
 
 def normalize_phone(phone: str) -> str:
@@ -321,7 +325,7 @@ class SheetDataManager:
                         name = row_dict.get("שם", "").strip()
                         phone = normalize_phone(row_dict.get("טלפון", ""))
                         
-                        # דריסת שלוחת ההודעות אם קיימת עמודה כזו בשיטס עבור המחלקה!
+                        # דריסת שלוחת ההודעות אם קיימת עמודה כזו בשיטס עבור המחלקה
                         custom_msg_ext = row_dict.get("שלוחת הודעות", "").strip("/")
                         if custom_msg_ext:
                             new_dept_messages_ext[dept_id] = custom_msg_ext
@@ -502,10 +506,7 @@ async def yemot_api_request(endpoint: str, params: dict = None, method: str = "G
 
 
 async def append_to_yemot_log(caller_phone: str, customer_name: str, agent_phone: str, agent_name: str, date_str: str, time_str: str, is_anonymous: bool):
-    """
-    רישום שורת לוג במערכת ימות המשיח ב-ivr2:30/Log.ini
-    מבצע קריאה של הקובץ כדי לדעת מהו המספר הבא (001.wav, 002.wav וכו').
-    """
+    """רישום שורת לוג במערכת ימות המשיח ב-ivr2:30/Log.ini"""
     try:
         res_get = await yemot_api_request("GetTextFile", params={"what": YEMOT_LOG_FILE_PATH}, timeout=4.0)
         current_content = ""
@@ -771,7 +772,7 @@ async def self_test_endpoint():
     """מבצע בדיקה אוטומטית מקצה לקצה ישירות מהדפדפן"""
     results = []
     
-    results.append(f"✅ טעינת הגדרות: מזוהים {len(sheet_data.personal_lines)} מחלקות עם קווים אישיים, ו-{len(sheet_data.customer_contacts)} לקוחות מטאב 4.")
+    results.append(f"✅ טעינת הגדרות: מזוהים {len(sheet_data.personal_lines)} מחלקות עם קווים אישיים, ו-{len(sheet_data.customer_contacts)} לקוחות.")
     
     test_call_id = "test_call_sim_1"
     test_caller_phone = "0520000001"
@@ -913,7 +914,7 @@ async def yemot_router(request: Request):
 
         if not is_agent:
             root_logger.warning(f"[דחייה] הטלפון {caller_phone} ניסה להיכנס לשלוחת הנציגים (10) אך אינו מוגדר בשיטס!")
-            return Response(f"go_to_folder=/{BASE_FOLDER}", media_type="text/plain; charset=utf-8")
+            return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
         has_waiting_call = False
         async with manager.lock:
@@ -940,10 +941,10 @@ async def yemot_router(request: Request):
                 asyncio.create_task(save_agent_last_heard_file(caller_phone, latest_wav))
                 return Response(f"id_list_message=t-מעביר אותך לשמיעת ההודעה&go_to_folder=/{msg_ext_full}", media_type="text/plain; charset=utf-8")
             else:
-                return Response(f"go_to_folder=/{BASE_FOLDER}", media_type="text/plain; charset=utf-8")
+                return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
         
         elif pressed == "3":
-            return Response(f"go_to_folder=/{BASE_FOLDER}", media_type="text/plain; charset=utf-8")
+            return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
         if has_waiting_call and has_new_msg:
             return Response("read=t-ישנה שיחה ממתינה בתור וקיימת הודעה חדשה. למענה לשיחה הקישו 1. לשמיעת ההודעה הקישו 2. לכניסה רגילה הקישו 3=digits,1,1,1,7,No,No,123", media_type="text/plain; charset=utf-8")
@@ -1002,13 +1003,12 @@ async def yemot_router(request: Request):
         if rec:
             tts_msg = format_recording_details_tts(rec)
             root_logger.info(f"הושמעו פרטי שיחה: {tts_msg}")
-            # מחזיר מיד להמשך ההקלטה ללא ניתוק!
             return Response(f"id_list_message={tts_msg}", media_type="text/plain; charset=utf-8")
         else:
             return Response("id_list_message=t-לא נמצאו פרטים על שיחה זו", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 5. שלוחת הנציגים/מנהלים הכללית (שלוחה 00/20)
+    # 5. שלוחת הנציגים/מנהלים הכללית (שלוחה 20)
     # ==============================================================
     agent_full_ext = build_path("20")
     if api_extension == agent_full_ext or api_extension == "20":
