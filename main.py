@@ -18,7 +18,7 @@ import re
 YEMOT_API_TOKEN = "0775311511:124578"
 
 # תיקיית הבסיס של התורים והנציגים (כרגע "00")
-BASE_FOLDER = "00"
+BASE_FOLDER = ""
 
 # שם התיקייה בשלוחה הראשית שבה נמצאים החדרים:
 ROOMS_ROOT_FOLDER = "rooms"
