@@ -38,7 +38,7 @@ DEPT_MESSAGES_EXTENSIONS = {
 # קישור ה-Google Sheets שלך
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1D_i2bqqZfEhc1CtSS2snoEeF_tZ1DVoXK4hWhGULJ5U/edit?usp=sharing"
 
-# שמות הגליונות הנסרקים ב-Google Sheets (כולל עזרה לנזקקים ומחלקה 4)
+# שמות הגליונות הנסרקים ב-Google Sheets
 DEPARTMENT_TABS = ["1", "2", "3", "4", "הסכמי חנויות", "עזרה", "עזרה לנזקקים"]
 
 # שם לשונית הלקוחות
@@ -57,7 +57,7 @@ DEPT_NAME_TO_ID = {
     "3": "3",
     "עזרה": "3",
     "עזרה לנזקקים": "3",
-    "4": "3",  # שלוחות 4/2/1 מנותבות לחדרי מחלקה 3 של עזרה לנזקקים
+    "4": "3",
     "הסכמי חנויות": "3",
 }
 
@@ -930,6 +930,7 @@ async def yemot_router(request: Request):
         msg_action = params.get("msg_action")
         action = params.get("action") or params.get("digits") or params.get("data") or params.get("key") or ""
 
+        # שלב א': אישור מענה לשיחה
         if call_action:
             root_logger.info(f"🔘 נציג {caller_phone} הקיש {call_action} בתפריט פרטי השיחה")
             if call_action == "1":
@@ -945,6 +946,7 @@ async def yemot_router(request: Request):
                 root_logger.info(f"↩️ נציג {caller_phone} בחר לדחות את השיחה ולחזור.")
                 return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
+        # שלב ב': שמיעת הודעה
         if msg_action:
             root_logger.info(f"🔘 נציג {caller_phone} הקיש {msg_action} בתפריט שמיעת הודעות")
             if msg_action == "1" and has_new_msg:
@@ -954,27 +956,29 @@ async def yemot_router(request: Request):
             else:
                 return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
+        # שלב ג': בחירה מתפריט שניהם יחד
         if action:
             root_logger.info(f"🔘 נציג {caller_phone} הקיש {action} בתפריט המשולב (שיחה + הודעה)")
             if action == "1" and has_waiting_call:
                 ident = format_caller_ident_for_tts(waiting_call)
-                return Response(f"read=t-שיחה ממתינה מאת {ident}. למעבר לשיחה הקישו 1, לניתוק הקישו 2=call_action,no,1,1,7,no,no,12", media_type="text/plain; charset=utf-8")
+                return Response(f"read=t-שיחה ממתינה מאת {ident} למעבר לשיחה הקישו אחת לניתוק הקישו שתיים=call_action,no,1,1,7,Digits", media_type="text/plain; charset=utf-8")
             elif action == "2" and has_new_msg:
                 asyncio.create_task(save_agent_last_heard_file(caller_phone, latest_wav))
                 return Response(f"id_list_message=t-מעביר אותך לשמיעת ההודעה&go_to_folder=/{msg_ext_full}", media_type="text/plain; charset=utf-8")
             elif action == "3":
                 return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
+        # תפריטי פתיחה - בפורמט read תקני לימות המשיח
         if has_waiting_call and has_new_msg:
             root_logger.info(f"📢 מציג לנציג {caller_phone}: קיימת גם שיחה ממתינה וגם הודעה חדשה.")
-            return Response("read=t-ישנה שיחה ממתינה וקיימת הודעה חדשה. למענה לשיחה הקישו 1, לשמיעת ההודעה הקישו 2, לכניסה רגילה הקישו 3=action,no,1,1,7,no,no,123", media_type="text/plain; charset=utf-8")
+            return Response("read=t-ישנה שיחה ממתינה וקיימת הודעה חדשה למענה לשיחה הקישו אחת לשמיעת ההודעה הקישו שתיים לכניסה רגילה הקישו שלוש=action,no,1,1,7,Digits", media_type="text/plain; charset=utf-8")
         elif has_waiting_call:
             ident = format_caller_ident_for_tts(waiting_call)
             root_logger.info(f"📢 מציג לנציג {caller_phone}: שיחה ממתינה מאת {ident}")
-            return Response(f"read=t-שיחה ממתינה מאת {ident}. למעבר לשיחה הקישו 1, לניתוק הקישו 2=call_action,no,1,1,7,no,no,12", media_type="text/plain; charset=utf-8")
+            return Response(f"read=t-שיחה ממתינה מאת {ident} למעבר לשיחה הקישו אחת לניתוק הקישו שתיים=call_action,no,1,1,7,Digits", media_type="text/plain; charset=utf-8")
         elif has_new_msg:
             root_logger.info(f"📢 מציג לנציג {caller_phone}: קיימת הודעה חדשה.")
-            return Response("read=t-קיימת הודעה חדשה. לשמיעת ההודעה הקישו 1, לכניסה רגילה הקישו 2=msg_action,no,1,1,7,no,no,12", media_type="text/plain; charset=utf-8")
+            return Response("read=t-קיימת הודעה חדשה לשמיעת ההודעה הקישו אחת לכניסה רגילה הקישו שתיים=msg_action,no,1,1,7,Digits", media_type="text/plain; charset=utf-8")
         else:
             root_logger.info(f"ℹ️ נציג {caller_phone} נכנס לשלוחה 10 - אין שיחות ממתינות ואין הודעות.")
             return Response(f"id_list_message=t-אין שיחות ממתינות ואין הודעות חדשות&go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
