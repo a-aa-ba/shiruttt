@@ -32,11 +32,11 @@ DEPT_MESSAGES_EXTENSIONS = {
     "1": "1/0/2",  
     "2": "2/0/2",  
     "3": "3/0/2",
-    "4": "4/0/2"  
+    "4": "4/0/2",  
 }
 
 # קישור ה-Google Sheets שלך
-GOOGLE_SHEET_URL = " = "https://docs.google.com/spreadsheets/d/1D_i2bqqZfEhc1CtSS2snoEeF_tZ1DVoXK4hWhGULJ5U/edit?usp=sha"
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1D_i2bqqZfEhc1CtSS2snoEeF_tZ1DVoXK4hWhGULJ5U/edit?usp=sharing"
 
 # שמות הגליונות ב-Google Sheets
 DEPARTMENT_TABS = ["1", "2", "3", "הסכמי חנויות"]
