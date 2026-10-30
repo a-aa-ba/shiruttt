@@ -38,10 +38,19 @@ DEPT_MESSAGES_EXTENSIONS = {
 # קישור ה-Google Sheets שלך
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1D_i2bqqZfEhc1CtSS2snoEeF_tZ1DVoXK4hWhGULJ5U/edit?usp=sharing"
 
+# 📌 מיפוי חד-חד-ערכי: מזהה מחלקה -> שם הלשונית המדויק בגיליון גוגל
+# אם הלשוניות אצלך בגיליון נקראות בשמות עבריים, שנה כאן (למשל "3": "הסכמי חנויות", "4": "עזרה לנזקקים")
+DEPARTMENT_TABS_MAPPING = {
+    "1": "1",
+    "2": "2",
+    "3": "3",
+    "4": "4",
+}
+
 # שם לשונית הלקוחות
 CONTACTS_TAB_NAME = "לקוחות"
 
-# מיפוי קפדני ומופרד של שמות מחלקות (1, 2, 3, 4)
+# מיפוי שמות מחלקות לתיקיות חדרים (1, 2, 3, 4)
 DEPT_NAME_TO_ID = {
     "1": "1",
     "ביגוד": "1",
@@ -256,38 +265,12 @@ class SheetDataManager:
             return match.group(1)
         return ""
 
-    async def get_sheet_tabs_with_gid(self, client: httpx.AsyncClient) -> List[Tuple[str, str]]:
-        """
-        שולף מגוגל שיטס את ה-GID (המזהה הפנימי) של כל לשונית כדי להוריד את ה-CSV שלה באופן מדויק.
-        זה מונע את הבאג של גוגל שמחזיר את חדר הביגוד עבור שמות בעברית!
-        """
-        tabs = []
-        try:
-            url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/htmlview"
-            res = await client.get(url, timeout=8.0, follow_redirects=True)
-            if res.status_code == 200:
-                text = res.text
-                matches = re.findall(r'<li id="sheet-button-([0-9]+)"[^>]*><a[^>]*>([^<]+)</a>', text)
-                if matches:
-                    for gid, name in matches:
-                        tabs.append((gid.strip(), name.strip()))
-
-                if not tabs:
-                    matches2 = re.findall(r'<a[^>]+href="#([0-9]+)"[^>]*>([^<]+)</a>', text)
-                    for gid, name in matches2:
-                        pair = (gid.strip(), name.strip())
-                        if pair not in tabs:
-                            tabs.append(pair)
-        except Exception as e:
-            root_logger.warning(f"⚠️ שגיאה בשליפת GIDs מ-htmlview: {e}")
-        return tabs
-
     async def reload_from_sheets(self):
         if not self.spreadsheet_id:
             root_logger.warning("⚠️ קישור Google Sheets אינו מוגדר.")
             return
 
-        root_logger.info("🔄 מתחיל סנכרון נתונים מ-Google Sheets (בשיטת GID ישירה)...")
+        root_logger.info("🔄 מתחיל סנכרון נתונים מ-Google Sheets...")
         new_personal_lines = {}
         new_dept_general_agents = {}
         new_general_queues = {}
@@ -298,49 +281,28 @@ class SheetDataManager:
         new_customer_contacts = {}
 
         async with httpx.AsyncClient() as client:
-            tabs_with_gid = await self.get_sheet_tabs_with_gid(client)
+            sheet1_content = None
 
-            if tabs_with_gid:
-                root_logger.info(f"📋 זוהו לשוניות ו-GIDs בגיליון: {tabs_with_gid}")
-            else:
-                # גיבוי אם htmlview חסום
-                tabs_with_gid = [("0", "1"), ("1", "2"), ("2", "3"), ("3", "4")]
-
-            first_sheet_content = None
-            processed_dept_ids = set()
-
-            for gid, tab_name in tabs_with_gid:
-                clean_tab_name = tab_name.strip()
-                
-                # אם זו לשונית לקוחות - נטפל בה בנפרד
-                if clean_tab_name in [CONTACTS_TAB_NAME, "לקוחות", "אנשי קשר"]:
-                    continue
-
-                dept_id = DEPT_NAME_TO_ID.get(clean_tab_name)
-                if not dept_id:
-                    dept_match = re.search(r'\d+', clean_tab_name)
-                    dept_id = dept_match.group(0) if dept_match else clean_tab_name
-
-                if dept_id in processed_dept_ids:
-                    continue
-
-                # הורדה לפי GID מדויק ולא לפי שם לשונית!
-                url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/export?format=csv&gid={gid}"
+            for dept_id, tab_name in DEPARTMENT_TABS_MAPPING.items():
+                tab_encoded = urllib.parse.quote(tab_name)
+                url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={tab_encoded}"
                 
                 try:
                     res = await client.get(url, timeout=10.0, follow_redirects=True)
                     if res.status_code != 200:
+                        root_logger.warning(f"⚠️ מחלקה {dept_id}: קריאת לשונית '{tab_name}' נכשלה (קוד HTTP {res.status_code})")
                         continue
 
                     content = res.content.decode('utf-8-sig').strip()
                     if not content or content.startswith("/*O_o*/"):
+                        root_logger.warning(f"⚠️ מחלקה {dept_id}: לשונית '{tab_name}' אינה קיימת בגיליון!")
                         continue
 
-                    # חומת הגנה: אם גוגל שיטס החזיר עבור מחלקה אחרת את אותו תוכן של חדר ביגוד (gid=0)
-                    if gid == "0" or dept_id == "1":
-                        first_sheet_content = content
-                    elif first_sheet_content and content == first_sheet_content:
-                        root_logger.warning(f"⚠️ גוגל ניסה להחזיר את חדר הביגוד עבור לשונית '{tab_name}' (GID {gid}) - מדלג!")
+                    # שמירת תוכן הלשונית הראשונה לצורך זיהוי זיופים של גוגל
+                    if dept_id == "1":
+                        sheet1_content = content
+                    elif sheet1_content and content == sheet1_content:
+                        root_logger.error(f"❌ שגיאה: הלשונית של מחלקה {dept_id} ('{tab_name}') לא נמצאה בגיליון! (גוגל החזיר במקומה את חדר הביגוד)")
                         continue
 
                     reader = csv.reader(io.StringIO(content))
@@ -350,9 +312,8 @@ class SheetDataManager:
 
                     headers = [h.strip() for h in rows[0]]
                     if not any(h in ["שלוחה", "טלפון", "שם"] for h in headers):
+                        root_logger.warning(f"⚠️ מחלקה {dept_id}: הלשונית '{tab_name}' אינה מכילה עמודות שלוחה/טלפון תקניות.")
                         continue
-
-                    processed_dept_ids.add(dept_id)
 
                     if dept_id not in new_dept_general_agents:
                         new_dept_general_agents[dept_id] = set()
@@ -382,7 +343,7 @@ class SheetDataManager:
                         if custom_msg_ext:
                             new_dept_messages_ext[dept_id] = custom_msg_ext
 
-                        # בדיקה האם מדובר בקו אישי או במנהל
+                        # זיהוי קפדני: האם מדובר בקו אישי או במנהל
                         row_text = " ".join(r)
                         is_personal = any(word in row_text for word in ["אישי", "מנהל", "פרטי"])
                         is_manager_role = "מנהל" in row_text
@@ -391,6 +352,7 @@ class SheetDataManager:
                         if name:
                             new_agent_names[phone] = name
 
+                        # שיוך שלוחה מדויק ללא חיתוך
                         possible_keys = {raw_sub}
                         if "/" not in raw_sub:
                             possible_keys.add(f"{dept_id}/{raw_sub}")
@@ -411,7 +373,7 @@ class SheetDataManager:
                                 new_agent_to_depts[phone] = set()
                             new_agent_to_depts[phone].add(dept_id)
                         else:
-                            # נציג כללי למחלקה זו בלבד!
+                            # נציג כללי בלבד!
                             new_dept_general_agents[dept_id].add(phone)
                             for k in possible_keys:
                                 new_general_queues[dept_id].add(k)
@@ -420,53 +382,47 @@ class SheetDataManager:
                             new_agent_to_depts[phone].add(dept_id)
 
                 except Exception as e:
-                    root_logger.warning(f"⚠️ שגיאה בקריאת טאב {tab_name} (GID {gid}): {e}")
+                    root_logger.warning(f"⚠️ שגיאה בקריאת טאב מחלקה {tab_name}: {e}")
 
             # טעינת לשונית לקוחות
-            contacts_gid = None
-            for gid, name in tabs_with_gid:
-                if name.strip() in [CONTACTS_TAB_NAME, "לקוחות", "אנשי קשר"]:
-                    contacts_gid = gid
-                    break
+            c_tab_encoded = urllib.parse.quote(CONTACTS_TAB_NAME)
+            url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={c_tab_encoded}"
+            try:
+                res = await client.get(url, timeout=10.0, follow_redirects=True)
+                if res.status_code == 200 and not res.text.strip().startswith("/*O_o*/"):
+                    content = res.content.decode('utf-8-sig')
+                    reader = csv.reader(io.StringIO(content))
+                    rows = [r for r in reader if any(cell.strip() for cell in r)]
+                    if rows:
+                        temp_contacts = {}
+                        for r in rows:
+                            if len(r) < 2:
+                                continue
+                            col_a = r[0].strip()
+                            col_b = r[1].strip()
 
-            if contacts_gid is not None:
-                c_url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/export?format=csv&gid={contacts_gid}"
-                try:
-                    res = await client.get(c_url, timeout=10.0, follow_redirects=True)
-                    if res.status_code == 200:
-                        content = res.content.decode('utf-8-sig')
-                        reader = csv.reader(io.StringIO(content))
-                        rows = [r for r in reader if any(cell.strip() for cell in r)]
-                        if rows:
-                            temp_contacts = {}
-                            for r in rows:
-                                if len(r) < 2:
-                                    continue
-                                col_a = r[0].strip()
-                                col_b = r[1].strip()
+                            if col_a in ["שם", "שם לקוח", "שם מלא", "name"] or any(w in col_b for w in ["מספר", "טלפון", "נייד", "סלולרי", "פלאפון", "phone"]):
+                                continue
 
-                                if col_a in ["שם", "שם לקוח", "שם מלא", "name"] or any(w in col_b for w in ["מספר", "טלפון", "נייד", "סלולרי", "פלאפון", "phone"]):
-                                    continue
+                            digits_b = re.sub(r'\D', '', col_b)
+                            digits_a = re.sub(r'\D', '', col_a)
 
-                                digits_b = re.sub(r'\D', '', col_b)
-                                digits_a = re.sub(r'\D', '', col_a)
+                            if len(digits_b) >= 7:
+                                cust_name = col_a
+                                cust_phone = normalize_phone(digits_b)
+                            elif len(digits_a) >= 7:
+                                cust_name = col_b
+                                cust_phone = normalize_phone(digits_a)
+                            else:
+                                continue
 
-                                if len(digits_b) >= 7:
-                                    cust_name = col_a
-                                    cust_phone = normalize_phone(digits_b)
-                                elif len(digits_a) >= 7:
-                                    cust_name = col_b
-                                    cust_phone = normalize_phone(digits_a)
-                                else:
-                                    continue
+                            if cust_name and cust_phone:
+                                temp_contacts[cust_phone] = cust_name
 
-                                if cust_name and cust_phone:
-                                    temp_contacts[cust_phone] = cust_name
-
-                            if temp_contacts:
-                                new_customer_contacts = temp_contacts
-                except Exception:
-                    pass
+                        if temp_contacts:
+                            new_customer_contacts = temp_contacts
+            except Exception:
+                pass
 
         self.personal_lines = new_personal_lines
         self.dept_general_agents = new_dept_general_agents
@@ -481,14 +437,14 @@ class SheetDataManager:
         total_gen = sum(len(v) for v in self.dept_general_agents.values())
         root_logger.info(f"✅ סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים כלליים, {len(self.customer_contacts)} לקוחות.")
         
-        # הדפסה נפרדת של נציגי כל מחלקה לאימות
-        for d_id in sorted(self.dept_general_agents.keys()):
-            agents = list(self.dept_general_agents[d_id])
+        # הדפסה נפרדת וברורה של נציגי כל מחלקה
+        for d_id in ["1", "2", "3", "4"]:
+            agents = list(self.dept_general_agents.get(d_id, set()))
             p_lines = len(self.personal_lines.get(d_id, {}))
             dept_title = {
                 "1": "ביגוד", 
                 "2": "צצא", 
-                "3": "הסדרים/הסכמי חנויות", 
+                "3": "הסדרים", 
                 "4": "עזרה לנזקקים"
             }.get(d_id, f"מחלקה {d_id}")
             root_logger.info(f"   👥 מחלקה {d_id} ({dept_title}): נציגים כלליים ({len(agents)}) -> {agents} | קווים אישיים ({p_lines})")
