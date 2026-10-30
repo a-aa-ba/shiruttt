@@ -297,7 +297,6 @@ class SheetDataManager:
                         root_logger.warning(f"⚠️ מחלקה {dept_id}: לשונית '{tab_name}' אינה קיימת בגיליון!")
                         continue
 
-                    # זיהוי הגנה: אם גוגל החזיר בטעות שוב את חדר ביגוד עבור מחלקה אחרת
                     if dept_id == "1":
                         sheet1_content = content
                     elif sheet1_content and content == sheet1_content:
@@ -338,11 +337,14 @@ class SheetDataManager:
                         if not raw_sub or not phone:
                             continue
                         
+                        # דילוג על שלוחות ההקלטה 4/2/1 ו-4/2/2 כדי שלא יירשמו כתורי נציגים
+                        if raw_sub in ["4/2/1", "4/2/2"]:
+                            continue
+
                         custom_msg_ext = row_dict.get("שלוחת הודעות", "").strip("/")
                         if custom_msg_ext:
                             new_dept_messages_ext[dept_id] = custom_msg_ext
 
-                        # זיהוי קפדני: האם מדובר בקו אישי או במנהל
                         row_text = " ".join(r)
                         is_personal = any(word in row_text for word in ["אישי", "מנהל", "פרטי"])
                         is_manager_role = "מנהל" in row_text
@@ -371,7 +373,6 @@ class SheetDataManager:
                                 new_agent_to_depts[phone] = set()
                             new_agent_to_depts[phone].add(dept_id)
                         else:
-                            # נציג כללי למחלקה זו בלבד!
                             new_dept_general_agents[dept_id].add(phone)
                             for k in possible_keys:
                                 new_general_queues[dept_id].add(k)
@@ -435,7 +436,6 @@ class SheetDataManager:
         total_gen = sum(len(v) for v in self.dept_general_agents.values())
         root_logger.info(f"✅ סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים כלליים, {len(self.customer_contacts)} לקוחות.")
         
-        # הדפסה נפרדת וברורה של נציגי כל מחלקה לאימות
         for d_id in ["1", "2", "3", "4"]:
             agents = list(self.dept_general_agents.get(d_id, set()))
             p_lines = len(self.personal_lines.get(d_id, {}))
@@ -1034,7 +1034,7 @@ async def yemot_router(request: Request):
             root_logger.info(f"📢 מציג לנציג {caller_phone}: קיימת הודעה חדשה.")
             return Response("read=t-קיימת הודעה חדשה לשמיעת ההודעה הקישו אחת לכניסה רגילה הקישו שתיים=msg_action,no,1,1,7,Digits", media_type="text/plain; charset=utf-8")
         else:
-            # ✨ שקט מוחלט: אין שיחות ואין הודעות - מעביר מיידית לתפריט הראשי ללא שום הודעה קולית!
+            # ✨ שקט מוחלט: אין שיחות ואין הודעות - מעביר מיידית לתפריט הראשי ללא שום השמעה!
             root_logger.info(f"ℹ️ נציג {caller_phone} נכנס לשלוחה 10 - אין שיחות ואין הודעות. מעביר מיידית לתפריט הראשי.")
             return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
@@ -1054,7 +1054,7 @@ async def yemot_router(request: Request):
         api_extension in ["30", "30/0", build_path("30"), build_path("30/0")] or
         api_extension.endswith("/30") or
         api_extension.endswith("/30/0") or
-        bool(what_file)
+        bool(what_file and not api_extension.startswith("4/0/1"))
     )
 
     if is_ext_30 and is_key_0:
@@ -1091,6 +1091,57 @@ async def yemot_router(request: Request):
             return Response("id_list_message=t-לא נמצאו פרטים על שיחה זו", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
+    # 🌟 4.1 שלוחות ההאזנה 4/0/1/1 ו-4/0/1/2: חיוג למשאיר ההודעה בלחיצה על 0
+    # ==============================================================
+    is_ext_4011 = api_extension.endswith("4/0/1/1") or api_extension.endswith("4/0/1/1/0") or sub_ext_raw.endswith("0/1/1")
+    is_ext_4012 = api_extension.endswith("4/0/1/2") or api_extension.endswith("4/0/1/2/0") or sub_ext_raw.endswith("0/1/2")
+
+    if (is_ext_4011 or is_ext_4012) and is_key_0:
+        match_wav = re.search(r'(\d{3})', what_file)
+        file_prefix = match_wav.group(1) if match_wav else "000"
+        
+        target_folder = "4/0/1/2" if is_ext_4012 else "4/0/1/1"
+        txt_path = f"ivr2:{target_folder}/{file_prefix}.txt"
+        
+        root_logger.info(f"🔍 שולף פרטי מאזין מקובץ {txt_path}...")
+        res_txt = await yemot_api_request("GetTextFile", params={"what": txt_path}, timeout=4.0)
+        
+        caller_phone_found = ""
+        if res_txt and res_txt.get("responseStatus") == "OK":
+            content = res_txt.get("contents", "")
+            found_digits = re.findall(r'(?:0\d{8,9}|972\d{8,9})', content)
+            if found_digits:
+                caller_phone_found = normalize_phone(found_digits[0])
+            elif content.strip():
+                caller_phone_found = normalize_phone(content.strip())
+
+        if not caller_phone_found:
+            root_logger.warning(f"⚠️ לא נמצא מספר טלפון ב-{txt_path}")
+            return Response("id_list_message=t-לא נמצא מספר טלפון לחיוג חוזר עבור הודעה זו", media_type="text/plain; charset=utf-8")
+
+        # א. שלוחה 4/0/1/2: חיוג אנונימי באמצעות ניטוביה (הנציג לא רואה ולא שומע את המספר!)
+        if is_ext_4012:
+            root_logger.info(f"🎭 מחייג אנונימית למשאיר ההודעה ({caller_phone_found}) דרך ניטוביה בשלוחה 4/0/1/2...")
+            nitoviya_ext = f"{target_folder}/nitoviya"
+            nitoviya_content = (
+                "type=nitoviya\n"
+                f"nitoviya_dial_to={caller_phone_found}\n"
+                "nitoviya_say_dial_to=no\n"
+            )
+            await yemot_api_request("UploadTextFile", method="POST", data={
+                "what": f"ivr2:{nitoviya_ext}/ext.ini",
+                "contents": nitoviya_content
+            }, timeout=4.0)
+
+            return Response(f"id_list_message=t-מעביר אותך לחיוג אנונימי למשאיר ההודעה&go_to_folder=/{nitoviya_ext}", media_type="text/plain; charset=utf-8")
+
+        # ב. שלוחה 4/0/1/1: חיוג רגיל גלוי
+        else:
+            root_logger.info(f"📞 מחייג ישירות למשאיר ההודעה: {caller_phone_found}")
+            spaced_phone = " ".join(caller_phone_found)
+            return Response(f"id_list_message=t-מחייג למשאיר ההודעה בטלפון {spaced_phone}&routing={caller_phone_found}", media_type="text/plain; charset=utf-8")
+
+    # ==============================================================
     # 5. שלוחת הנציגים/מנהלים הכללית (שלוחה 20)
     # ==============================================================
     agent_full_ext = build_path("20")
@@ -1114,6 +1165,10 @@ async def yemot_router(request: Request):
     sub_ext = api_extension
     if BASE_FOLDER and sub_ext.startswith(f"{BASE_FOLDER}/"):
         sub_ext = sub_ext[len(BASE_FOLDER) + 1:]
+
+    # שלוחות הקלטה לא מנוהלות כתור נציגים!
+    if sub_ext in ["4/2/1", "4/2/2"]:
+        return Response("noop=yes", media_type="text/plain; charset=utf-8")
 
     if len(manager.waiting_calls) == 0:
         await sheet_data.reload_from_sheets()
@@ -1190,7 +1245,7 @@ async def yemot_router(request: Request):
 
     # כניסה ראשונית של המאזין לתור
     async with manager.lock:
-        # ✨ ניקוי שיחה קודמת של אותו מספר טלפון אם הוא ניתק וחייג מחדש
+        # ניקוי שיחה קודמת של אותו מאזין בחיוג חוזר
         same_phone_ghosts = [cid for cid, c in manager.waiting_calls.items() if c.phone == caller_phone and cid != call_id]
         for old_cid in same_phone_ghosts:
             old_call = manager.waiting_calls.pop(old_cid, None)
