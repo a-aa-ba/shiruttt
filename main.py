@@ -38,9 +38,6 @@ DEPT_MESSAGES_EXTENSIONS = {
 # קישור ה-Google Sheets שלך
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1D_i2bqqZfEhc1CtSS2snoEeF_tZ1DVoXK4hWhGULJ5U/edit?usp=sharing"
 
-# שמות לשוניות אפשריות לסריקה
-DEPARTMENT_TABS = ["1", "2", "3", "4", "ביגוד", "צצא", "הסדרים", "הסכמי חנויות", "עזרה", "עזרה לנזקקים"]
-
 # שם לשונית הלקוחות
 CONTACTS_TAB_NAME = "לקוחות"
 
@@ -259,25 +256,38 @@ class SheetDataManager:
             return match.group(1)
         return ""
 
-    async def get_real_sheet_tabs(self, client: httpx.AsyncClient) -> List[str]:
-        """מאתר ישירות את שמות הלשוניות האמיתיות שקיימות בגיליון למניעת קריאת לשוניות פיקטיביות"""
+    async def get_sheet_tabs_with_gid(self, client: httpx.AsyncClient) -> List[Tuple[str, str]]:
+        """
+        שולף מגוגל שיטס את ה-GID (המזהה הפנימי) של כל לשונית כדי להוריד את ה-CSV שלה באופן מדויק.
+        זה מונע את הבאג של גוגל שמחזיר את חדר הביגוד עבור שמות בעברית!
+        """
+        tabs = []
         try:
             url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/htmlview"
-            res = await client.get(url, timeout=6.0, follow_redirects=True)
+            res = await client.get(url, timeout=8.0, follow_redirects=True)
             if res.status_code == 200:
-                matches = re.findall(r'<li id="sheet-button-[^"]+"><a[^>]+>([^<]+)</a>', res.text)
+                text = res.text
+                matches = re.findall(r'<li id="sheet-button-([0-9]+)"[^>]*><a[^>]*>([^<]+)</a>', text)
                 if matches:
-                    return [m.strip() for m in matches if m.strip()]
-        except Exception:
-            pass
-        return []
+                    for gid, name in matches:
+                        tabs.append((gid.strip(), name.strip()))
+
+                if not tabs:
+                    matches2 = re.findall(r'<a[^>]+href="#([0-9]+)"[^>]*>([^<]+)</a>', text)
+                    for gid, name in matches2:
+                        pair = (gid.strip(), name.strip())
+                        if pair not in tabs:
+                            tabs.append(pair)
+        except Exception as e:
+            root_logger.warning(f"⚠️ שגיאה בשליפת GIDs מ-htmlview: {e}")
+        return tabs
 
     async def reload_from_sheets(self):
         if not self.spreadsheet_id:
             root_logger.warning("⚠️ קישור Google Sheets אינו מוגדר.")
             return
 
-        root_logger.info("🔄 מתחיל סנכרון נתונים מ-Google Sheets...")
+        root_logger.info("🔄 מתחיל סנכרון נתונים מ-Google Sheets (בשיטת GID ישירה)...")
         new_personal_lines = {}
         new_dept_general_agents = {}
         new_general_queues = {}
@@ -288,50 +298,57 @@ class SheetDataManager:
         new_customer_contacts = {}
 
         async with httpx.AsyncClient() as client:
-            # איתור הלשוניות שקיימות בפועל בגיליון
-            real_tabs = await self.get_real_sheet_tabs(client)
-            if real_tabs:
-                tabs_to_process = [t for t in real_tabs if t != CONTACTS_TAB_NAME and t not in ["לקוחות", "אנשי קשר"]]
-                root_logger.info(f"📋 זוהו לשוניות אמיתיות בגיליון: {real_tabs}")
-            else:
-                tabs_to_process = DEPARTMENT_TABS
+            tabs_with_gid = await self.get_sheet_tabs_with_gid(client)
 
+            if tabs_with_gid:
+                root_logger.info(f"📋 זוהו לשוניות ו-GIDs בגיליון: {tabs_with_gid}")
+            else:
+                # גיבוי אם htmlview חסום
+                tabs_with_gid = [("0", "1"), ("1", "2"), ("2", "3"), ("3", "4")]
+
+            first_sheet_content = None
             processed_dept_ids = set()
 
-            for tab_name in tabs_to_process:
+            for gid, tab_name in tabs_with_gid:
                 clean_tab_name = tab_name.strip()
+                
+                # אם זו לשונית לקוחות - נטפל בה בנפרד
+                if clean_tab_name in [CONTACTS_TAB_NAME, "לקוחות", "אנשי קשר"]:
+                    continue
+
                 dept_id = DEPT_NAME_TO_ID.get(clean_tab_name)
                 if not dept_id:
                     dept_match = re.search(r'\d+', clean_tab_name)
                     dept_id = dept_match.group(0) if dept_match else clean_tab_name
 
-                # אם מחלקה זו כבר נטענה מלשונית אחרת, לא טוענים שוב למניעת הכפלות!
                 if dept_id in processed_dept_ids:
                     continue
 
-                tab_encoded = urllib.parse.quote(tab_name)
-                url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={tab_encoded}"
+                # הורדה לפי GID מדויק ולא לפי שם לשונית!
+                url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/export?format=csv&gid={gid}"
                 
                 try:
                     res = await client.get(url, timeout=10.0, follow_redirects=True)
                     if res.status_code != 200:
                         continue
 
-                    # אם גוגל שיטס החזיר שגיאה (הלשונית לא קיימת) - מדלגים מיד!
-                    text_start = res.text.strip()
-                    if text_start.startswith("/*O_o*/") or "google.visualization.Query.setResponse" in res.text:
-                        if '"status":"error"' in res.text or 'INVALID_QUERY' in res.text:
-                            continue
+                    content = res.content.decode('utf-8-sig').strip()
+                    if not content or content.startswith("/*O_o*/"):
+                        continue
 
-                    content = res.content.decode('utf-8-sig')
+                    # חומת הגנה: אם גוגל שיטס החזיר עבור מחלקה אחרת את אותו תוכן של חדר ביגוד (gid=0)
+                    if gid == "0" or dept_id == "1":
+                        first_sheet_content = content
+                    elif first_sheet_content and content == first_sheet_content:
+                        root_logger.warning(f"⚠️ גוגל ניסה להחזיר את חדר הביגוד עבור לשונית '{tab_name}' (GID {gid}) - מדלג!")
+                        continue
+
                     reader = csv.reader(io.StringIO(content))
                     rows = list(reader)
                     if len(rows) < 2:
                         continue
 
                     headers = [h.strip() for h in rows[0]]
-
-                    # וידוא שזה גיליון נציגים תקני
                     if not any(h in ["שלוחה", "טלפון", "שם"] for h in headers):
                         continue
 
@@ -365,7 +382,7 @@ class SheetDataManager:
                         if custom_msg_ext:
                             new_dept_messages_ext[dept_id] = custom_msg_ext
 
-                        # בדיקה קפדנית האם מדובר בקו אישי או במנהל
+                        # בדיקה האם מדובר בקו אישי או במנהל
                         row_text = " ".join(r)
                         is_personal = any(word in row_text for word in ["אישי", "מנהל", "פרטי"])
                         is_manager_role = "מנהל" in row_text
@@ -394,7 +411,7 @@ class SheetDataManager:
                                 new_agent_to_depts[phone] = set()
                             new_agent_to_depts[phone].add(dept_id)
                         else:
-                            # נציג כללי בלבד!
+                            # נציג כללי למחלקה זו בלבד!
                             new_dept_general_agents[dept_id].add(phone)
                             for k in possible_keys:
                                 new_general_queues[dept_id].add(k)
@@ -403,22 +420,23 @@ class SheetDataManager:
                             new_agent_to_depts[phone].add(dept_id)
 
                 except Exception as e:
-                    root_logger.warning(f"⚠️ שגיאה בקריאת טאב מחלקה {tab_name}: {e}")
+                    root_logger.warning(f"⚠️ שגיאה בקריאת טאב {tab_name} (GID {gid}): {e}")
 
-            # טעינת לקוחות
-            contacts_tabs_to_try = [CONTACTS_TAB_NAME, "לקוחות", "אנשי קשר"]
-            loaded_tab_name = None
+            # טעינת לשונית לקוחות
+            contacts_gid = None
+            for gid, name in tabs_with_gid:
+                if name.strip() in [CONTACTS_TAB_NAME, "לקוחות", "אנשי קשר"]:
+                    contacts_gid = gid
+                    break
 
-            for c_tab in contacts_tabs_to_try:
-                c_tab_encoded = urllib.parse.quote(c_tab)
-                url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={c_tab_encoded}"
+            if contacts_gid is not None:
+                c_url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/export?format=csv&gid={contacts_gid}"
                 try:
-                    res = await client.get(url, timeout=10.0, follow_redirects=True)
-                    if res.status_code == 200 and not res.text.strip().startswith("/*O_o*/"):
+                    res = await client.get(c_url, timeout=10.0, follow_redirects=True)
+                    if res.status_code == 200:
                         content = res.content.decode('utf-8-sig')
                         reader = csv.reader(io.StringIO(content))
                         rows = [r for r in reader if any(cell.strip() for cell in r)]
-                        
                         if rows:
                             temp_contacts = {}
                             for r in rows:
@@ -446,9 +464,7 @@ class SheetDataManager:
                                     temp_contacts[cust_phone] = cust_name
 
                             if temp_contacts:
-                                loaded_tab_name = c_tab
                                 new_customer_contacts = temp_contacts
-                                break
                 except Exception:
                     pass
 
@@ -465,7 +481,7 @@ class SheetDataManager:
         total_gen = sum(len(v) for v in self.dept_general_agents.values())
         root_logger.info(f"✅ סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים כלליים, {len(self.customer_contacts)} לקוחות.")
         
-        # הדפסה ברורה ושקופה של כל מחלקה ומחלקה
+        # הדפסה נפרדת של נציגי כל מחלקה לאימות
         for d_id in sorted(self.dept_general_agents.keys()):
             agents = list(self.dept_general_agents[d_id])
             p_lines = len(self.personal_lines.get(d_id, {}))
