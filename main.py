@@ -329,10 +329,9 @@ class SheetDataManager:
                         if name:
                             new_agent_names[phone] = name
 
+                        # שיוך שלוחה מדויק ללא חיתוך שגורם להתנגשויות!
                         possible_keys = {raw_sub}
-                        if "/" in raw_sub:
-                            possible_keys.add(raw_sub.split("/")[-1])
-                        else:
+                        if "/" not in raw_sub:
                             possible_keys.add(f"{dept_id}/{raw_sub}")
 
                         if is_personal:
@@ -1065,7 +1064,7 @@ async def yemot_router(request: Request):
                 return Response(f"id_list_message=t-אין שיחות ממתינות כעת&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 6. כניסת מאזינים לתור
+    # 6. כניסת מאזינים לתור (זיהוי חכם עם עדיפות למחלקה הרצויה)
     # ==============================================================
     sub_ext = api_extension
     if BASE_FOLDER and sub_ext.startswith(f"{BASE_FOLDER}/"):
@@ -1075,7 +1074,7 @@ async def yemot_router(request: Request):
         await sheet_data.reload_from_sheets()
 
     sub_ext_parts = sub_ext.split("/")
-    possible_keys = [sub_ext, sub_ext_parts[-1]]
+    possible_keys = [sub_ext]
 
     dept_id = None
     queue_type = None
@@ -1083,8 +1082,21 @@ async def yemot_router(request: Request):
     transfer_msg = "מעביר אותך לשיחה עם נציג"
     is_anon = False
 
-    # 1. חיפוש קו אישי בכל המחלקות
-    for d_id, p_dict in sheet_data.personal_lines.items():
+    # זיהוי המחלקה המיועדת מראש לפי תחילית השלוחה (למשל שלוחה 3 או 3/1 או 4/2/1)
+    preferred_dept = None
+    if len(sub_ext_parts) >= 1:
+        preferred_dept = DEPT_NAME_TO_ID.get(sub_ext_parts[0], sub_ext_parts[0])
+
+    depts_to_search = []
+    if preferred_dept and preferred_dept in sheet_data.dept_general_agents:
+        depts_to_search.append(preferred_dept)
+    for d in sheet_data.dept_general_agents.keys():
+        if d not in depts_to_search:
+            depts_to_search.append(d)
+
+    # 1. חיפוש קו אישי
+    for d_id in depts_to_search:
+        p_dict = sheet_data.personal_lines.get(d_id, {})
         for k in possible_keys:
             if k in p_dict:
                 p_info = p_dict[k]
@@ -1099,9 +1111,10 @@ async def yemot_router(request: Request):
         if queue_type:
             break
 
-    # 2. חיפוש תור אנונימי בכל המחלקות
+    # 2. חיפוש תור אנונימי
     if not queue_type:
-        for d_id, a_set in sheet_data.anonymous_queue_extensions.items():
+        for d_id in depts_to_search:
+            a_set = sheet_data.anonymous_queue_extensions.get(d_id, set())
             if any(k in a_set for k in possible_keys):
                 dept_id = d_id
                 queue_type = "general"
@@ -1109,22 +1122,21 @@ async def yemot_router(request: Request):
                 is_anon = True
                 break
 
-    # 3. חיפוש תור כללי בכל המחלקות
+    # 3. חיפוש תור כללי
     if not queue_type:
-        for d_id, g_set in sheet_data.general_queue_extensions.items():
+        for d_id in depts_to_search:
+            g_set = sheet_data.general_queue_extensions.get(d_id, set())
             if any(k in g_set for k in possible_keys):
                 dept_id = d_id
                 queue_type = "general"
                 transfer_msg = "מעביר אותך לשיחה עם נציג"
                 break
 
-    # 4. ברירת מחדל לפי שלוחה ראשית
-    if not queue_type and len(sub_ext_parts) >= 1:
-        prefix_id = DEPT_NAME_TO_ID.get(sub_ext_parts[0], sub_ext_parts[0])
-        if prefix_id in sheet_data.dept_general_agents:
-            dept_id = prefix_id
-            queue_type = "general"
-            transfer_msg = "מעביר אותך לשיחה עם נציג"
+    # 4. ברירת מחדל אם נכנסו ישירות לשלוחת המחלקה הראשית (למשל שלוחה "3" או "1")
+    if not queue_type and preferred_dept and preferred_dept in sheet_data.dept_general_agents:
+        dept_id = preferred_dept
+        queue_type = "general"
+        transfer_msg = "מעביר אותך לשיחה עם נציג"
 
     if not queue_type or not dept_id:
         root_logger.warning(f"⚠️ שלוחה [{api_extension}] אינה מוגדרת בשיטס באף מחלקה! (טלפון מאזין: {caller_phone})")
