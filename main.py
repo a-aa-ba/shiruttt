@@ -435,7 +435,7 @@ class SheetDataManager:
         total_gen = sum(len(v) for v in self.dept_general_agents.values())
         root_logger.info(f"✅ סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים כלליים, {len(self.customer_contacts)} לקוחות.")
         
-        # הדפסה נפרדת וברורה של נציגי כל מחלקה לאימות מושלם!
+        # הדפסה נפרדת וברורה של נציגי כל מחלקה לאימות
         for d_id in ["1", "2", "3", "4"]:
             agents = list(self.dept_general_agents.get(d_id, set()))
             p_lines = len(self.personal_lines.get(d_id, {}))
@@ -903,7 +903,7 @@ async def yemot_router(request: Request):
 
     root_logger.info(f"📥 פנייה מהמערכת: שלוחה [{api_extension or 'ראשי'}] | טלפון: {caller_phone or 'אנונימי'} | CallId: {call_id}")
 
-    # 1. ניתוק שיחה
+    # 1. ניתוק שיחה (כשמתקבל דיווח ניתוק מימות המשיח)
     if hangup == "yes" and call_id:
         async with manager.lock:
             removed_call = manager.waiting_calls.pop(call_id, None)
@@ -958,8 +958,23 @@ async def yemot_router(request: Request):
         agent_name = sheet_data.agent_names.get(caller_phone, "")
         root_logger.info(f"👤 נציג נכנס לשלוחה 10: {caller_phone} ({agent_name or 'ללא שם'})")
 
+        # 🔍 בדיקה חיה מול ימות המשיח: ניקוי שיחות מנותקות בזמן אמת!
         waiting_call = None
         async with manager.lock:
+            active_calls = await get_active_calls()
+            if active_calls is not None:
+                active_ids = {str(c.get("id")) for c in active_calls}
+                ghost_ids = [cid for cid in manager.waiting_calls if cid not in active_ids]
+                for cid in ghost_ids:
+                    ghost_call = manager.waiting_calls.pop(cid, None)
+                    manager.waiting_events.pop(cid, None)
+                    manager.waiting_destinations.pop(cid, None)
+                    manager.last_seen.pop(cid, None)
+                    if ghost_call:
+                        root_logger.info(f"🧹 שיחה {cid} ({ghost_call.phone}) נותקה בעבר ע\"י המאזין ונוקתה מיידית.")
+                        t_key = f"personal_{ghost_call.target_manager_phone}" if ghost_call.queue_type == "personal" else f"general_{ghost_call.dept_id}"
+                        manager.cancel_tzintuk_if_empty(t_key)
+
             waiting_call = get_waiting_call_for_agent(caller_phone)
 
         has_waiting_call = waiting_call is not None
@@ -969,6 +984,7 @@ async def yemot_router(request: Request):
         msg_action = params.get("msg_action")
         action = params.get("action") or params.get("digits") or params.get("data") or params.get("key") or ""
 
+        # שלב א': אישור מענה לשיחה
         if call_action:
             root_logger.info(f"🔘 נציג {caller_phone} הקיש {call_action} בתפריט פרטי השיחה")
             if call_action == "1":
@@ -984,6 +1000,7 @@ async def yemot_router(request: Request):
                 root_logger.info(f"↩️ נציג {caller_phone} בחר לדחות את השיחה ולחזור.")
                 return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
+        # שלב ב': שמיעת הודעה
         if msg_action:
             root_logger.info(f"🔘 נציג {caller_phone} הקיש {msg_action} בתפריט שמיעת הודעות")
             if msg_action == "1" and has_new_msg:
@@ -993,6 +1010,7 @@ async def yemot_router(request: Request):
             else:
                 return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
+        # שלב ג': בחירה מתפריט שניהם יחד
         if action:
             root_logger.info(f"🔘 נציג {caller_phone} הקיש {action} בתפריט המשולב (שיחה + הודעה)")
             if action == "1" and has_waiting_call:
@@ -1016,8 +1034,9 @@ async def yemot_router(request: Request):
             root_logger.info(f"📢 מציג לנציג {caller_phone}: קיימת הודעה חדשה.")
             return Response("read=t-קיימת הודעה חדשה לשמיעת ההודעה הקישו אחת לכניסה רגילה הקישו שתיים=msg_action,no,1,1,7,Digits", media_type="text/plain; charset=utf-8")
         else:
-            root_logger.info(f"ℹ️ נציג {caller_phone} נכנס לשלוחה 10 - אין שיחות ממתינות ואין הודעות.")
-            return Response(f"id_list_message=t-אין שיחות ממתינות ואין הודעות חדשות&go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
+            # ✨ שקט מוחלט: אין שיחות ואין הודעות - מעביר מיידית לתפריט הראשי ללא שום הודעה קולית!
+            root_logger.info(f"ℹ️ נציג {caller_phone} נכנס לשלוחה 10 - אין שיחות ואין הודעות. מעביר מיידית לתפריט הראשי.")
+            return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
     # 4. שלוחה 30: השמעת פרטי השיחה בהקשה על 0
@@ -1171,6 +1190,15 @@ async def yemot_router(request: Request):
 
     # כניסה ראשונית של המאזין לתור
     async with manager.lock:
+        # ✨ ניקוי שיחה קודמת של אותו מספר טלפון אם הוא ניתק וחייג מחדש
+        same_phone_ghosts = [cid for cid, c in manager.waiting_calls.items() if c.phone == caller_phone and cid != call_id]
+        for old_cid in same_phone_ghosts:
+            old_call = manager.waiting_calls.pop(old_cid, None)
+            manager.waiting_events.pop(old_cid, None)
+            manager.waiting_destinations.pop(old_cid, None)
+            if old_call:
+                root_logger.info(f"🔄 הוסרה שיחה קודמת של מאזין {caller_phone} ({old_cid}) עקב חיוג מחדש.")
+
         if call_id not in manager.waiting_calls:
             q_call = QueuedCall(
                 call_id=call_id,
