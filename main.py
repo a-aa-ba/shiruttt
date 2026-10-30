@@ -38,13 +38,12 @@ DEPT_MESSAGES_EXTENSIONS = {
 # קישור ה-Google Sheets שלך
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1D_i2bqqZfEhc1CtSS2snoEeF_tZ1DVoXK4hWhGULJ5U/edit?usp=sharing"
 
-# 📌 מיפוי חד-חד-ערכי: מזהה מחלקה -> שם הלשונית המדויק בגיליון גוגל
-# אם הלשוניות אצלך בגיליון נקראות בשמות עבריים, שנה כאן (למשל "3": "הסכמי חנויות", "4": "עזרה לנזקקים")
+# 📌 מיפוי שמות הלשוניות בדיוק לפי התמונה מהגיליון שלך!
 DEPARTMENT_TABS_MAPPING = {
-    "1": "1",
-    "2": "2",
-    "3": "3",
-    "4": "4",
+    "1": "חדר ביגוד",
+    "2": 'חדר צצ"א',
+    "3": "הסכמי חנויות",
+    "4": "עזרה לנזקקים",
 }
 
 # שם לשונית הלקוחות
@@ -58,9 +57,9 @@ DEPT_NAME_TO_ID = {
 
     "2": "2",
     "צצא": "2",
-    "צצ\"א": "2",
+    'צצ"א': "2",
     "חדר צצא": "2",
-    "חדר צצ\"א": "2",
+    'חדר צצ"א': "2",
 
     "3": "3",
     "הסדרים": "3",
@@ -298,7 +297,7 @@ class SheetDataManager:
                         root_logger.warning(f"⚠️ מחלקה {dept_id}: לשונית '{tab_name}' אינה קיימת בגיליון!")
                         continue
 
-                    # שמירת תוכן הלשונית הראשונה לצורך זיהוי זיופים של גוגל
+                    # זיהוי הגנה: אם גוגל החזיר בטעות שוב את חדר ביגוד עבור מחלקה אחרת
                     if dept_id == "1":
                         sheet1_content = content
                     elif sheet1_content and content == sheet1_content:
@@ -352,7 +351,6 @@ class SheetDataManager:
                         if name:
                             new_agent_names[phone] = name
 
-                        # שיוך שלוחה מדויק ללא חיתוך
                         possible_keys = {raw_sub}
                         if "/" not in raw_sub:
                             possible_keys.add(f"{dept_id}/{raw_sub}")
@@ -373,7 +371,7 @@ class SheetDataManager:
                                 new_agent_to_depts[phone] = set()
                             new_agent_to_depts[phone].add(dept_id)
                         else:
-                            # נציג כללי בלבד!
+                            # נציג כללי למחלקה זו בלבד!
                             new_dept_general_agents[dept_id].add(phone)
                             for k in possible_keys:
                                 new_general_queues[dept_id].add(k)
@@ -437,14 +435,14 @@ class SheetDataManager:
         total_gen = sum(len(v) for v in self.dept_general_agents.values())
         root_logger.info(f"✅ סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים כלליים, {len(self.customer_contacts)} לקוחות.")
         
-        # הדפסה נפרדת וברורה של נציגי כל מחלקה
+        # הדפסה נפרדת וברורה של נציגי כל מחלקה לאימות מושלם!
         for d_id in ["1", "2", "3", "4"]:
             agents = list(self.dept_general_agents.get(d_id, set()))
             p_lines = len(self.personal_lines.get(d_id, {}))
             dept_title = {
                 "1": "ביגוד", 
-                "2": "צצא", 
-                "3": "הסדרים", 
+                "2": 'צצא', 
+                "3": "הסכמי חנויות", 
                 "4": "עזרה לנזקקים"
             }.get(d_id, f"מחלקה {d_id}")
             root_logger.info(f"   👥 מחלקה {d_id} ({dept_title}): נציגים כלליים ({len(agents)}) -> {agents} | קווים אישיים ({p_lines})")
