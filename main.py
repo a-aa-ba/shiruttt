@@ -1109,15 +1109,23 @@ async def yemot_router(request: Request):
         caller_phone_found = ""
         if res_txt and res_txt.get("responseStatus") == "OK":
             content = res_txt.get("contents", "")
-            found_digits = re.findall(r'(?:0\d{8,9}|972\d{8,9})', content)
-            if found_digits:
-                caller_phone_found = normalize_phone(found_digits[0])
-            elif content.strip():
-                caller_phone_found = normalize_phone(content.strip())
+            root_logger.info(f"📄 תוכן קובץ {file_prefix}.txt שהתקבל מימות המשיח: {content}")
+            
+            # חילוץ ישיר ומדויק: המספר שמופיע אחרי Phone- (מתעלם לחלוטין מ-CustomerDID!)
+            m_phone = re.search(r'Phone-([0-9]+)', content)
+            if m_phone:
+                caller_phone_found = normalize_phone(m_phone.group(1))
+            else:
+                # גיבוי: חיפוש כללי
+                m_back = re.search(r'(?:CallerId|Phone|Caller|caller_id|טלפון)[-=\s]*([0-9]+)', content, re.IGNORECASE)
+                if m_back:
+                    caller_phone_found = normalize_phone(m_back.group(1))
 
         if not caller_phone_found:
-            root_logger.warning(f"⚠️ לא נמצא מספר טלפון ב-{txt_path}")
+            root_logger.warning(f"⚠️ לא נמצא מספר טלפון תקין של מאזין ב-{txt_path}")
             return Response("id_list_message=t-לא נמצא מספר טלפון לחיוג חוזר עבור הודעה זו", media_type="text/plain; charset=utf-8")
+
+        root_logger.info(f"🎯 אותר מספר המאזין שהשאיר את ההודעה: {caller_phone_found}")
 
         # א. שלוחה 4/0/1/2: חיוג אנונימי באמצעות ניטוביה (הנציג לא רואה ולא שומע את המספר!)
         if is_ext_4012:
