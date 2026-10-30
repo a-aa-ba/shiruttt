@@ -259,7 +259,7 @@ class SheetDataManager:
             root_logger.warning("⚠️ קישור Google Sheets אינו מוגדר.")
             return
 
-        root_logger.info("🔄 מרענן נתוני מחלקות, שלוחות ולקוחות מ-Google Sheets...")
+        root_logger.info("🔄 מתחיל סנכרון נתונים מ-Google Sheets...")
         new_personal_lines = {}
         new_dept_general_agents = {}
         new_general_queues = {}
@@ -418,7 +418,9 @@ class SheetDataManager:
 
         total_p = sum(len(v) for v in self.personal_lines.values())
         total_gen = sum(len(v) for v in self.dept_general_agents.values())
-        root_logger.info(f"✅ סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים, ו-{len(self.customer_contacts)} לקוחות נטענו.")
+        root_logger.info(f"✅ סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים כלליים, {len(self.customer_contacts)} לקוחות.")
+        for d_id, agents in self.dept_general_agents.items():
+            root_logger.info(f"   👥 מחלקה {d_id}: נציגים כלליים זמינים ({len(agents)}): {list(agents)}")
 
 
 sheet_data = SheetDataManager(GOOGLE_SHEET_URL)
@@ -479,7 +481,7 @@ async def yemot_api_request(endpoint: str, params: dict = None, method: str = "G
                 res = await client.get(url, params=p, timeout=timeout)
             return res.json()
     except Exception as e:
-        root_logger.error(f"❌ שגיאת API מול ימות המשיח ({endpoint}): {e}")
+        root_logger.error(f"❌ שגיאת תקשורת API מול ימות המשיח ({endpoint}): {e}")
         return None
 
 
@@ -603,11 +605,13 @@ async def is_agent_connected(phone: str) -> bool:
 async def send_tzintuk(phone: str):
     clean_phone = normalize_phone(phone)
     if len(clean_phone) not in [9, 10]:
+        root_logger.warning(f"⚠️ דילוג על צינתוק: מספר טלפון אינו תקין ({phone})")
         return
 
     agent_name = sheet_data.agent_names.get(clean_phone, "")
     name_str = f" ({agent_name})" if agent_name else ""
 
+    root_logger.info(f"📱 מנסה לשלוח צינתוק לנציג: {clean_phone}{name_str}...")
     result = await yemot_api_request("RunTzintuk", params={
         "phones": f"tzl:{clean_phone}",
         "TzintukTimeOut": 10,
@@ -615,7 +619,9 @@ async def send_tzintuk(phone: str):
     }, timeout=3.0)
 
     if result and result.get("responseStatus") == "OK":
-        root_logger.info(f"📱 נשלח צינתוק לנציג: {clean_phone}{name_str}")
+        root_logger.info(f"✅ צינתוק נשלח בהצלחה לנציג: {clean_phone}{name_str}")
+    else:
+        root_logger.error(f"❌ שגיאה בשליחת צינתוק לנציג {clean_phone}: תשובת המערכת הייתה {result}")
 
 
 async def run_tzintuk_loop(target_key: str, get_phones_func):
@@ -623,23 +629,30 @@ async def run_tzintuk_loop(target_key: str, get_phones_func):
     try:
         while True:
             if not manager.has_waiting_for_target(target_key):
+                root_logger.info(f"ℹ️ אין יותר שיחות ממתינות עבור {target_key} - לולאת הצינתוקים הסתיימה.")
                 break
+
             phones = get_phones_func()
             if isinstance(phones, str):
                 phones = [phones]
+
             if not phones:
+                root_logger.warning(f"⚠️ אין נציגים מוגדרים עבור {target_key}! ממתין 15 שניות לפני בדיקה חוזרת...")
                 await asyncio.sleep(15)
                 continue
 
+            root_logger.info(f"🔄 מתחיל סבב צינתוקים עבור {target_key} (לנציגים: {phones})")
             for phone in phones:
                 if not manager.has_waiting_for_target(target_key):
                     return
+
                 if await is_agent_connected(phone):
                     agent_name = sheet_data.agent_names.get(phone, "")
-                    root_logger.info(f"ℹ️ נציג {phone} ({agent_name or 'ללא שם'}) כבר בשיחה פעילה - מדלג עליו בצינתוק.")
+                    root_logger.info(f"ℹ️ נציג {phone} ({agent_name or 'ללא שם'}) כבר בשיחה פעילה - מדלג עליו בסבב הנוכחי.")
                     continue
 
                 await send_tzintuk(phone)
+
                 agent_entered = False
                 for _ in range(10):
                     await asyncio.sleep(1)
@@ -659,10 +672,11 @@ async def run_tzintuk_loop(target_key: str, get_phones_func):
                             return
 
             if manager.has_waiting_for_target(target_key):
-                root_logger.info("⏳ הסתיים סבב צינתוקים ללא מענה. ממתין 20 שניות לפני סבב נוסף...")
+                root_logger.info(f"⏳ הסתיים סבב צינתוקים ללא מענה עבור {target_key}. ממתין 20 שניות לפני הסבב הבא...")
                 await asyncio.sleep(20)
+
     except asyncio.CancelledError:
-        root_logger.info(f"⏹️ סבב הצינתוקים עבור {target_key} הסתיים.")
+        root_logger.info(f"⏹️ סבב הצינתוקים עבור {target_key} בוטל.")
     except Exception as e:
         root_logger.error(f"❌ תקלה בסבב צינתוקים ({target_key}): {e}")
     finally:
@@ -930,7 +944,6 @@ async def yemot_router(request: Request):
         msg_action = params.get("msg_action")
         action = params.get("action") or params.get("digits") or params.get("data") or params.get("key") or ""
 
-        # שלב א': אישור מענה לשיחה
         if call_action:
             root_logger.info(f"🔘 נציג {caller_phone} הקיש {call_action} בתפריט פרטי השיחה")
             if call_action == "1":
@@ -946,7 +959,6 @@ async def yemot_router(request: Request):
                 root_logger.info(f"↩️ נציג {caller_phone} בחר לדחות את השיחה ולחזור.")
                 return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
-        # שלב ב': שמיעת הודעה
         if msg_action:
             root_logger.info(f"🔘 נציג {caller_phone} הקיש {msg_action} בתפריט שמיעת הודעות")
             if msg_action == "1" and has_new_msg:
@@ -956,7 +968,6 @@ async def yemot_router(request: Request):
             else:
                 return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
-        # שלב ג': בחירה מתפריט שניהם יחד
         if action:
             root_logger.info(f"🔘 נציג {caller_phone} הקיש {action} בתפריט המשולב (שיחה + הודעה)")
             if action == "1" and has_waiting_call:
@@ -968,7 +979,7 @@ async def yemot_router(request: Request):
             elif action == "3":
                 return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
-        # תפריטי פתיחה - בפורמט read תקני לימות המשיח
+        # תפריטי פתיחה
         if has_waiting_call and has_new_msg:
             root_logger.info(f"📢 מציג לנציג {caller_phone}: קיימת גם שיחה ממתינה וגם הודעה חדשה.")
             return Response("read=t-ישנה שיחה ממתינה וקיימת הודעה חדשה למענה לשיחה הקישו אחת לשמיעת ההודעה הקישו שתיים לכניסה רגילה הקישו שלוש=action,no,1,1,7,Digits", media_type="text/plain; charset=utf-8")
@@ -1054,7 +1065,7 @@ async def yemot_router(request: Request):
                 return Response(f"id_list_message=t-אין שיחות ממתינות כעת&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 6. כניסת מאזינים לתור (זיהוי חכם ללא הגבלת ספרות)
+    # 6. כניסת מאזינים לתור
     # ==============================================================
     sub_ext = api_extension
     if BASE_FOLDER and sub_ext.startswith(f"{BASE_FOLDER}/"):
@@ -1098,7 +1109,7 @@ async def yemot_router(request: Request):
                 is_anon = True
                 break
 
-    # 3. חיפוש תור כללי בכל המחלקות (כולל 4/2/1, 4/2/2 וכו')
+    # 3. חיפוש תור כללי בכל המחלקות
     if not queue_type:
         for d_id, g_set in sheet_data.general_queue_extensions.items():
             if any(k in g_set for k in possible_keys):
@@ -1107,7 +1118,7 @@ async def yemot_router(request: Request):
                 transfer_msg = "מעביר אותך לשיחה עם נציג"
                 break
 
-    # 4. ברירת מחדל לפי שלוחה ראשית אם נרשמה ישירות
+    # 4. ברירת מחדל לפי שלוחה ראשית
     if not queue_type and len(sub_ext_parts) >= 1:
         prefix_id = DEPT_NAME_TO_ID.get(sub_ext_parts[0], sub_ext_parts[0])
         if prefix_id in sheet_data.dept_general_agents:
@@ -1121,6 +1132,7 @@ async def yemot_router(request: Request):
 
     customer_name = sheet_data.customer_contacts.get(caller_phone, "")
 
+    # כניסה ראשונית של המאזין לתור
     async with manager.lock:
         if call_id not in manager.waiting_calls:
             q_call = QueuedCall(
@@ -1147,12 +1159,14 @@ async def yemot_router(request: Request):
                 phone_func = lambda: list(sheet_data.dept_general_agents.get(dept_id, []))
 
             if t_key not in manager.tzintuk_tasks or manager.tzintuk_tasks[t_key].done():
+                root_logger.info(f"⚡ מפעיל סבב צינתוקים עבור {t_key}")
                 manager.tzintuk_tasks[t_key] = asyncio.create_task(run_tzintuk_loop(t_key, phone_func))
 
             display_caller = f"{customer_name} ({caller_phone})" if customer_name else caller_phone
-            root_logger.info(f"⏳ מאזין {display_caller} נכנס לתור מחלקה {dept_id} דרך שלוחה {api_extension} (מיקום: {pos})")
+            root_logger.info(f"⏳ מאזין {display_caller} נכנס לתור מחלקה {dept_id} דרך שלוחה {api_extension} (מיקום בתור: {pos})")
             return Response(f"id_list_message=t-מיקומך בתור הוא {pos}&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
 
+    # המתנה רציפה
     event = asyncio.Event()
     manager.waiting_events[call_id] = event
 
@@ -1169,6 +1183,8 @@ async def yemot_router(request: Request):
                 pos = sum(1 for c in manager.waiting_calls.values() if c.target_manager_phone == target_manager_phone and c.entry_time <= manager.waiting_calls[call_id].entry_time)
             else:
                 pos = sum(1 for c in manager.waiting_calls.values() if c.dept_id == dept_id and c.queue_type == "general" and c.entry_time <= manager.waiting_calls[call_id].entry_time)
+        display_caller = f"{customer_name} ({caller_phone})" if customer_name else caller_phone
+        root_logger.info(f"⏳ מאזין {display_caller} ממשיך להמתין בתור {dept_id} (מיקום נוכחי: {pos})")
         return Response(f"id_list_message=t-מיקומך בתור הוא {pos}&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
     finally:
         manager.waiting_events.pop(call_id, None)
