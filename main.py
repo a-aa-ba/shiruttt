@@ -39,26 +39,35 @@ DEPT_MESSAGES_EXTENSIONS = {
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1D_i2bqqZfEhc1CtSS2snoEeF_tZ1DVoXK4hWhGULJ5U/edit?usp=sharing"
 
 # שמות הגליונות הנסרקים ב-Google Sheets
-DEPARTMENT_TABS = ["1", "2", "3", "4", "הסכמי חנויות", "עזרה", "עזרה לנזקקים"]
+DEPARTMENT_TABS = ["1", "2", "3", "4", "הסדרים", "הסכמי חנויות", "עזרה", "עזרה לנזקקים"]
 
 # שם לשונית הלקוחות
 CONTACTS_TAB_NAME = "לקוחות"
 
-# מיפוי שמות מחלקות לתיקיות החדרים (1, 2, 3)
+# מיפוי שמות מחלקות מופרד לחלוטין (1, 2, 3, 4 ללא עירוב!)
 DEPT_NAME_TO_ID = {
+    # מחלקה 1: ביגוד
     "1": "1",
     "ביגוד": "1",
     "חדר ביגוד": "1",
+
+    # מחלקה 2: צצא
     "2": "2",
     "צצא": "2",
     "צצ\"א": "2",
     "חדר צצא": "2",
     "חדר צצ\"א": "2",
+
+    # מחלקה 3: הסדרים / הסכמי חנויות (נפרד לחלוטין!)
     "3": "3",
-    "עזרה": "3",
-    "עזרה לנזקקים": "3",
-    "4": "3",
+    "הסדרים": "3",
     "הסכמי חנויות": "3",
+    "הסכם חנויות": "3",
+
+    # מחלקה 4: עזרה לנזקקים (נפרד לחלוטין!)
+    "4": "4",
+    "עזרה": "4",
+    "עזרה לנזקקים": "4",
 }
 
 WAIT_TIMEOUT = 50                
@@ -329,7 +338,7 @@ class SheetDataManager:
                         if name:
                             new_agent_names[phone] = name
 
-                        # שיוך שלוחה מדויק ללא חיתוך שגורם להתנגשויות!
+                        # שיוך מדויק של שלוחות (שלוחה 1/3 היא 1/3, שלוחה 3 היא 3)
                         possible_keys = {raw_sub}
                         if "/" not in raw_sub:
                             possible_keys.add(f"{dept_id}/{raw_sub}")
@@ -360,6 +369,7 @@ class SheetDataManager:
                 except Exception as e:
                     root_logger.warning(f"⚠️ שגיאה בקריאת טאב מחלקה {tab_name}: {e}")
 
+            # טעינת לקוחות
             contacts_tabs_to_try = ["לקוחות", CONTACTS_TAB_NAME, "אנשי קשר"]
             loaded_tab_name = None
 
@@ -418,8 +428,17 @@ class SheetDataManager:
         total_p = sum(len(v) for v in self.personal_lines.values())
         total_gen = sum(len(v) for v in self.dept_general_agents.values())
         root_logger.info(f"✅ סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים כלליים, {len(self.customer_contacts)} לקוחות.")
-        for d_id, agents in self.dept_general_agents.items():
-            root_logger.info(f"   👥 מחלקה {d_id}: נציגים כלליים זמינים ({len(agents)}): {list(agents)}")
+        
+        # הדפסה ברורה של נציגי כל מחלקה בנפרד למניעת כל ספק!
+        for d_id in sorted(self.dept_general_agents.keys()):
+            agents = list(self.dept_general_agents[d_id])
+            dept_title = {
+                "1": "ביגוד", 
+                "2": "צצא", 
+                "3": "הסדרים/הסכמי חנויות", 
+                "4": "עזרה לנזקקים"
+            }.get(d_id, f"מחלקה {d_id}")
+            root_logger.info(f"   👥 מחלקה {d_id} ({dept_title}): נציגים ({len(agents)}) -> {agents}")
 
 
 sheet_data = SheetDataManager(GOOGLE_SHEET_URL)
@@ -683,9 +702,10 @@ async def run_tzintuk_loop(target_key: str, get_phones_func):
 
 
 async def find_free_room(dept_id: str) -> Tuple[str, int]:
+    """מאתר חדר פנוי בתיקיית המחלקה (1, 2, 3, 4) ואם תפוס גולש לחדרי גיבוי"""
     active_calls = await get_active_calls()
     active_paths = [str(c.get("path", "")) for c in (active_calls or [])]
-    folders_to_check = [str(dept_id), "4", "5"]
+    folders_to_check = [str(dept_id), "5"]
 
     for folder in folders_to_check:
         rooms_base = f"{ROOMS_ROOT_FOLDER}/{folder}"
@@ -1064,7 +1084,7 @@ async def yemot_router(request: Request):
                 return Response(f"id_list_message=t-אין שיחות ממתינות כעת&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 6. כניסת מאזינים לתור (זיהוי חכם עם עדיפות למחלקה הרצויה)
+    # 6. כניסת מאזינים לתור (זיהוי קפדני ומופרד של המחלקה!)
     # ==============================================================
     sub_ext = api_extension
     if BASE_FOLDER and sub_ext.startswith(f"{BASE_FOLDER}/"):
@@ -1082,15 +1102,16 @@ async def yemot_router(request: Request):
     transfer_msg = "מעביר אותך לשיחה עם נציג"
     is_anon = False
 
-    # זיהוי המחלקה המיועדת מראש לפי תחילית השלוחה (למשל שלוחה 3 או 3/1 או 4/2/1)
+    # קביעה מוחלטת של המחלקה לפי התחילית (שלוחה 3 -> מחלקה 3 בלבד! שלוחה 4 -> מחלקה 4 בלבד!)
     preferred_dept = None
     if len(sub_ext_parts) >= 1:
         preferred_dept = DEPT_NAME_TO_ID.get(sub_ext_parts[0], sub_ext_parts[0])
 
+    # סדר חיפוש: קודם כל ולפני הכל בודקים את המחלקה הספציפית הזו!
     depts_to_search = []
     if preferred_dept and preferred_dept in sheet_data.dept_general_agents:
         depts_to_search.append(preferred_dept)
-    for d in sheet_data.dept_general_agents.keys():
+    for d in sorted(sheet_data.dept_general_agents.keys()):
         if d not in depts_to_search:
             depts_to_search.append(d)
 
@@ -1132,7 +1153,7 @@ async def yemot_router(request: Request):
                 transfer_msg = "מעביר אותך לשיחה עם נציג"
                 break
 
-    # 4. ברירת מחדל אם נכנסו ישירות לשלוחת המחלקה הראשית (למשל שלוחה "3" או "1")
+    # 4. ברירת מחדל ישירה לפי שלוחת השורש של המחלקה (למשל שלוחה "3" או "4" ישירות)
     if not queue_type and preferred_dept and preferred_dept in sheet_data.dept_general_agents:
         dept_id = preferred_dept
         queue_type = "general"
