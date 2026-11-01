@@ -289,7 +289,6 @@ class SheetDataManager:
 
             for dept_id, tab_name in DEPARTMENT_TABS_MAPPING.items():
                 tab_encoded = urllib.parse.quote(tab_name)
-                # הוספת timestamp ייחודי למניעת שמירת מטמון ישן ע"י גוגל שיטס
                 cache_buster = int(time.time() * 1000)
                 url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={tab_encoded}&t={cache_buster}"
                 
@@ -339,8 +338,16 @@ class SheetDataManager:
                         row_dict = {headers[i]: r[i].strip() for i in range(min(len(headers), len(r)))}
 
                         raw_sub = row_dict.get("שלוחה", "").strip("/")
+                        if not raw_sub and len(r) >= 1:
+                            raw_sub = r[0].strip().strip("/")
+
                         name = row_dict.get("שם", "").strip()
+                        if not name and len(r) >= 2:
+                            name = r[1].strip()
+
                         phone = normalize_phone(row_dict.get("טלפון", ""))
+                        if not phone and len(r) >= 3:
+                            phone = normalize_phone(r[2])
 
                         if not raw_sub or not phone:
                             continue
@@ -353,22 +360,24 @@ class SheetDataManager:
                         if custom_msg_ext:
                             new_dept_messages_ext[dept_id] = custom_msg_ext
 
-                        # זיהוי קפדני: בדיקה בעמודת תפקיד ובכל השורה
+                        # 🎯 זיהוי קפדני ובלעדי מתוך עמודת "תפקיד" (העמודה הרביעית):
                         role_val = row_dict.get("תפקיד", "").strip()
-                        row_text = " ".join(r)
-                        
-                        is_personal = any(word in role_val for word in ["אישי", "מנהל", "פרטי"]) or any(word in row_text for word in ["אישי", "פרטי"])
-                        is_manager_role = "מנהל" in role_val or "מנהל" in row_text
-                        is_anonymous = "אנונימי" in role_val or "אנונימי" in row_text
+                        if not role_val and len(r) >= 4:
+                            role_val = r[3].strip()
+
+                        is_personal = "אישי" in role_val
+                        is_anonymous = "אנונימי" in role_val
+                        is_manager_role = "מנהל" in role_val or "מנהל" in name
 
                         if name:
                             new_agent_names[phone] = name
 
-                        # 🔑 יצירת כל מפתחות החיפוש האפשריים עבור שלוחה זו (למשל: '8', '1/8')
+                        # יצירת מפתחות חיפוש עבור השלוחה
                         keys_for_row = {raw_sub}
-                        last_seg = raw_sub.split("/")[-1]
-                        keys_for_row.add(last_seg)
-                        keys_for_row.add(f"{dept_id}/{last_seg}")
+                        if "/" in raw_sub:
+                            keys_for_row.add(raw_sub.split("/")[-1])
+                        else:
+                            keys_for_row.add(f"{dept_id}/{raw_sub}")
 
                         if is_personal:
                             for k in keys_for_row:
@@ -447,20 +456,21 @@ class SheetDataManager:
         self.agent_names = new_agent_names
         self.customer_contacts = new_customer_contacts
 
-        total_p = sum(len(v) for v in self.personal_lines.values())
+        # ספירת קווים אישיים מדויקת (לפי כמות נציגים/שלוחות מקוריות ולא לפי כמות המפתחות)
+        total_p = sum(len(set(info.phone for info in lines.values())) for lines in self.personal_lines.values())
         total_gen = sum(len(v) for v in self.dept_general_agents.values())
         root_logger.info(f"✅ סנכרון הושלם: {total_p} קווים אישיים, {total_gen} נציגים כלליים, {len(self.customer_contacts)} לקוחות.")
         
         for d_id in ["1", "2", "3", "4"]:
             agents = list(self.dept_general_agents.get(d_id, set()))
-            p_lines = len(self.personal_lines.get(d_id, {}))
+            p_lines = len(set(info.phone for info in self.personal_lines.get(d_id, {}).values()))
             dept_title = {
                 "1": "ביגוד", 
                 "2": 'צצא', 
                 "3": "הסכמי חנויות", 
                 "4": "עזרה לנזקקים"
             }.get(d_id, f"מחלקה {d_id}")
-            root_logger.info(f"   👥 מחלקה {d_id} ({dept_title}): נציגים כלליים ({len(agents)}) -> {agents} | מפתחות אישיים ({p_lines})")
+            root_logger.info(f"   👥 מחלקה {d_id} ({dept_title}): נציגים כלליים ({len(agents)}) -> {agents} | קווים אישיים ({p_lines})")
 
 
 sheet_data = SheetDataManager(GOOGLE_SHEET_URL)
@@ -482,7 +492,7 @@ class SystemManager:
 
     def has_waiting_for_target(self, target_key: str) -> bool:
         for call in self.waiting_calls.values():
-            if target_key.startswith("personal_") and call.target_manager_phone == target_key.replace("personal_", ""):
+            if target_key.startswith("personal_") and normalize_phone(call.target_manager_phone or "") == target_key.replace("personal_", ""):
                 return True
             elif target_key.startswith("general_") and f"general_{call.dept_id}" == target_key:
                 return True
@@ -741,15 +751,19 @@ async def find_free_room(dept_id: str) -> Tuple[str, int]:
 
 
 def get_waiting_call_for_agent(caller_phone: str) -> Optional[QueuedCall]:
+    clean_agent = normalize_phone(caller_phone)
+    
+    # 1. עדיפות עליונה: שיחה בקו אישי לנציג זה
     personal_calls = [
         c for c in manager.waiting_calls.values()
-        if c.queue_type == "personal" and c.target_manager_phone == caller_phone
+        if c.queue_type == "personal" and normalize_phone(c.target_manager_phone or "") == clean_agent
     ]
     if personal_calls:
         personal_calls.sort(key=lambda x: x.entry_time)
         return personal_calls[0]
 
-    allowed_depts = sheet_data.agent_to_depts.get(caller_phone, set())
+    # 2. עדיפות שנייה: שיחה כללית במחלקות המורשות של הנציג
+    allowed_depts = sheet_data.agent_to_depts.get(clean_agent, set())
     general_calls = [
         c for c in manager.waiting_calls.values()
         if c.queue_type == "general" and c.dept_id in allowed_depts
@@ -826,7 +840,7 @@ async def bridge_call_for_agent(caller_phone: str, agent_name: str, selected_cal
         )
     )
 
-    t_key = f"personal_{selected_call.target_manager_phone}" if selected_call.queue_type == "personal" else f"general_{selected_call.dept_id}"
+    t_key = f"personal_{normalize_phone(selected_call.target_manager_phone or '')}" if selected_call.queue_type == "personal" else f"general_{selected_call.dept_id}"
     manager.cancel_tzintuk_if_empty(t_key)
 
     c_display = f"{customer_name} ({selected_call.phone})" if customer_name else selected_call.phone
@@ -838,24 +852,21 @@ async def background_cleanup_loop():
     while True:
         try:
             if manager.waiting_calls:
-                active_calls = await get_active_calls()
-                if active_calls is not None:
-                    active_ids = {str(c.get("id")) for c in active_calls}
-                    now = time.time()
-                    async with manager.lock:
-                        to_remove = [
-                            call for cid, call in manager.waiting_calls.items()
-                            if cid not in active_ids and (now - manager.last_seen.get(cid, 0)) >= GRACE_PERIOD
-                        ]
-                        for call in to_remove:
-                            cid = call.call_id
-                            root_logger.info(f"⚠️ שיחה {cid} ({call.phone}) נותקה ללא דיווח והוסרה מהתור.")
-                            manager.waiting_calls.pop(cid, None)
-                            manager.waiting_events.pop(cid, None)
-                            manager.waiting_destinations.pop(cid, None)
-                            manager.last_seen.pop(cid, None)
-                            t_key = f"personal_{call.target_manager_phone}" if call.queue_type == "personal" else f"general_{call.dept_id}"
-                            manager.cancel_tzintuk_if_empty(t_key)
+                now = time.time()
+                async with manager.lock:
+                    to_remove = [
+                        call for cid, call in manager.waiting_calls.items()
+                        if (now - manager.last_seen.get(cid, 0)) >= GRACE_PERIOD
+                    ]
+                    for call in to_remove:
+                        cid = call.call_id
+                        root_logger.info(f"⚠️ שיחה {cid} ({call.phone}) נותקה ללא דיווח והוסרה מהתור (חלף Grace Period).")
+                        manager.waiting_calls.pop(cid, None)
+                        manager.waiting_events.pop(cid, None)
+                        manager.waiting_destinations.pop(cid, None)
+                        manager.last_seen.pop(cid, None)
+                        t_key = f"personal_{normalize_phone(call.target_manager_phone or '')}" if call.queue_type == "personal" else f"general_{call.dept_id}"
+                        manager.cancel_tzintuk_if_empty(t_key)
         except Exception as e:
             root_logger.error(f"❌ שגיאה בלולאת רקע: {e}")
         await asyncio.sleep(15)
@@ -918,7 +929,7 @@ async def yemot_router(request: Request):
 
     root_logger.info(f"📥 פנייה מהמערכת: שלוחה [{api_extension or 'ראשי'}] | טלפון: {caller_phone or 'אנונימי'} | CallId: {call_id}")
 
-    # 1. ניתוק שיחה (כשמתקבל דיווח ניתוק מימות המשיח)
+    # 1. ניתוק שיחה (כשמתקבל דיווח ניתוק מיידי מימות המשיח)
     if hangup == "yes" and call_id:
         async with manager.lock:
             removed_call = manager.waiting_calls.pop(call_id, None)
@@ -936,7 +947,7 @@ async def yemot_router(request: Request):
             if removed_call:
                 display_name = removed_call.caller_name or removed_call.phone
                 root_logger.info(f"📴 מאזין {display_name} ניתק את השיחה ויצא מהתור.")
-                t_key = f"personal_{removed_call.target_manager_phone}" if removed_call.queue_type == "personal" else f"general_{removed_call.dept_id}"
+                t_key = f"personal_{normalize_phone(removed_call.target_manager_phone or '')}" if removed_call.queue_type == "personal" else f"general_{removed_call.dept_id}"
                 manager.cancel_tzintuk_if_empty(t_key)
 
         return Response("noop=yes", media_type="text/plain; charset=utf-8")
@@ -962,7 +973,7 @@ async def yemot_router(request: Request):
         if not is_agent:
             for dept_dict in sheet_data.personal_lines.values():
                 for info in dept_dict.values():
-                    if info.phone == caller_phone:
+                    if normalize_phone(info.phone) == caller_phone:
                         is_agent = True
                         break
 
@@ -973,23 +984,9 @@ async def yemot_router(request: Request):
         agent_name = sheet_data.agent_names.get(caller_phone, "")
         root_logger.info(f"👤 נציג נכנס לשלוחה 10: {caller_phone} ({agent_name or 'ללא שם'})")
 
-        # 🔍 בדיקה חיה מול ימות המשיח: ניקוי שיחות מנותקות בזמן אמת!
+        # איתור שיחה ממתינה לנציג זה (אישית או כללית)
         waiting_call = None
         async with manager.lock:
-            active_calls = await get_active_calls()
-            if active_calls is not None:
-                active_ids = {str(c.get("id")) for c in active_calls}
-                ghost_ids = [cid for cid in manager.waiting_calls if cid not in active_ids]
-                for cid in ghost_ids:
-                    ghost_call = manager.waiting_calls.pop(cid, None)
-                    manager.waiting_events.pop(cid, None)
-                    manager.waiting_destinations.pop(cid, None)
-                    manager.last_seen.pop(cid, None)
-                    if ghost_call:
-                        root_logger.info(f"🧹 שיחה {cid} ({ghost_call.phone}) נותקה בעבר ע\"י המאזין ונוקתה מיידית.")
-                        t_key = f"personal_{ghost_call.target_manager_phone}" if ghost_call.queue_type == "personal" else f"general_{ghost_call.dept_id}"
-                        manager.cancel_tzintuk_if_empty(t_key)
-
             waiting_call = get_waiting_call_for_agent(caller_phone)
 
         has_waiting_call = waiting_call is not None
@@ -1009,7 +1006,7 @@ async def yemot_router(request: Request):
                         agent_dest = await bridge_call_for_agent(caller_phone, agent_name, selected_call)
                         return Response(f"id_list_message=t-מעביר אותך לשיחה&go_to_folder={agent_dest}", media_type="text/plain; charset=utf-8")
                     else:
-                        root_logger.info(f"ℹ️ נציג {caller_phone} אישר מענה אך השיחה כבר נותקה ע\"י המאזין.")
+                        root_logger.info(f"ℹ️ נציג {caller_phone} אישר מענה אך השיחה כבר אינה ממתינה בתור.")
                         return Response(f"id_list_message=t-השיחה כבר אינה ממתינה בתור&go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
             elif call_action == "2":
                 root_logger.info(f"↩️ נציג {caller_phone} בחר לדחות את השיחה ולחזור.")
@@ -1183,7 +1180,6 @@ async def yemot_router(request: Request):
     if BASE_FOLDER and sub_ext.startswith(f"{BASE_FOLDER}/"):
         sub_ext = sub_ext[len(BASE_FOLDER) + 1:]
 
-    # שלוחות הקלטה לא מנוהלות כתור נציגים!
     if sub_ext in ["4/2/1", "4/2/2"]:
         return Response("noop=yes", media_type="text/plain; charset=utf-8")
 
@@ -1192,7 +1188,6 @@ async def yemot_router(request: Request):
 
     sub_ext_parts = sub_ext.split("/")
     
-    # 🔑 יצירת כל מפתחות החיפוש האפשריים: '1/8', '8'
     possible_keys = [sub_ext]
     if len(sub_ext_parts) >= 2:
         possible_keys.append(sub_ext_parts[-1])
@@ -1215,7 +1210,7 @@ async def yemot_router(request: Request):
         if d not in depts_to_search:
             depts_to_search.append(d)
 
-    # 1. חיפוש קו אישי (עדיפות ראשונה ועליונה!)
+    # 1. חיפוש קו אישי (עדיפות עליונה)
     for d_id in depts_to_search:
         p_dict = sheet_data.personal_lines.get(d_id, {})
         for k in possible_keys:
@@ -1293,8 +1288,9 @@ async def yemot_router(request: Request):
 
             # הפעלת צינתוק: אישי -> לנציג היחיד! כללי -> לכל נציגי המחלקה
             if queue_type == "personal":
-                pos = sum(1 for c in manager.waiting_calls.values() if c.target_manager_phone == target_manager_phone)
-                t_key = f"personal_{target_manager_phone}"
+                clean_target = normalize_phone(target_manager_phone or "")
+                pos = sum(1 for c in manager.waiting_calls.values() if normalize_phone(c.target_manager_phone or "") == clean_target)
+                t_key = f"personal_{clean_target}"
                 phone_func = lambda: [target_manager_phone]
                 root_logger.info(f"📱 מפעיל סבב צינתוק אישי עבור הנציג {target_manager_phone} בלבד!")
             else:
@@ -1324,7 +1320,8 @@ async def yemot_router(request: Request):
     except asyncio.TimeoutError:
         async with manager.lock:
             if queue_type == "personal":
-                pos = sum(1 for c in manager.waiting_calls.values() if c.target_manager_phone == target_manager_phone and c.entry_time <= manager.waiting_calls[call_id].entry_time)
+                clean_target = normalize_phone(target_manager_phone or "")
+                pos = sum(1 for c in manager.waiting_calls.values() if normalize_phone(c.target_manager_phone or "") == clean_target and c.entry_time <= manager.waiting_calls[call_id].entry_time)
             else:
                 pos = sum(1 for c in manager.waiting_calls.values() if c.dept_id == dept_id and c.queue_type == "general" and c.entry_time <= manager.waiting_calls[call_id].entry_time)
         display_caller = f"{customer_name} ({caller_phone})" if customer_name else caller_phone
