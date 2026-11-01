@@ -36,7 +36,7 @@ DEPT_MESSAGES_EXTENSIONS = {
 }
 
 # קישור ה-Google Sheets שלך
-GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1D_i2bqqZfEhc1CtSS2snoEeF_tZ1DVoXK4hWhGULJ5U/edit?usp=sharing"
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1JfWZ0mUyqHznX-sOAiz4j71VRoVM_nx9Jf6ux962Dg4/edit?usp=sharing"
 
 # 📌 מיפוי שמות הלשוניות בדיוק לפי התמונה מהגיליון שלך!
 DEPARTMENT_TABS_MAPPING = {
