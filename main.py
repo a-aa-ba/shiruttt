@@ -279,12 +279,19 @@ class SheetDataManager:
         new_agent_names = {}
         new_customer_contacts = {}
 
-        async with httpx.AsyncClient() as client:
+        headers_http = {
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache"
+        }
+
+        async with httpx.AsyncClient(headers=headers_http) as client:
             sheet1_content = None
 
             for dept_id, tab_name in DEPARTMENT_TABS_MAPPING.items():
                 tab_encoded = urllib.parse.quote(tab_name)
-                url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={tab_encoded}"
+                # הוספת timestamp ייחודי למניעת שמירת מטמון ישן ע"י גוגל שיטס
+                cache_buster = int(time.time() * 1000)
+                url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={tab_encoded}&t={cache_buster}"
                 
                 try:
                     res = await client.get(url, timeout=10.0, follow_redirects=True)
@@ -297,6 +304,7 @@ class SheetDataManager:
                         root_logger.warning(f"⚠️ מחלקה {dept_id}: לשונית '{tab_name}' אינה קיימת בגיליון!")
                         continue
 
+                    # זיהוי הגנה מפני זיופי גוגל שיטס
                     if dept_id == "1":
                         sheet1_content = content
                     elif sheet1_content and content == sheet1_content:
@@ -337,7 +345,7 @@ class SheetDataManager:
                         if not raw_sub or not phone:
                             continue
                         
-                        # דילוג על שלוחות ההקלטה 4/2/1 ו-4/2/2 כדי שלא יירשמו כתורי נציגים
+                        # שלוחות הקלטה לא נרשמות כתור
                         if raw_sub in ["4/2/1", "4/2/2"]:
                             continue
 
@@ -345,36 +353,43 @@ class SheetDataManager:
                         if custom_msg_ext:
                             new_dept_messages_ext[dept_id] = custom_msg_ext
 
+                        # זיהוי קפדני: בדיקה בעמודת תפקיד ובכל השורה
+                        role_val = row_dict.get("תפקיד", "").strip()
                         row_text = " ".join(r)
-                        is_personal = any(word in row_text for word in ["אישי", "מנהל", "פרטי"])
-                        is_manager_role = "מנהל" in row_text
-                        is_anonymous = "אנונימי" in row_text
+                        
+                        is_personal = any(word in role_val for word in ["אישי", "מנהל", "פרטי"]) or any(word in row_text for word in ["אישי", "פרטי"])
+                        is_manager_role = "מנהל" in role_val or "מנהל" in row_text
+                        is_anonymous = "אנונימי" in role_val or "אנונימי" in row_text
 
                         if name:
                             new_agent_names[phone] = name
 
-                        possible_keys = {raw_sub}
-                        if "/" not in raw_sub:
-                            possible_keys.add(f"{dept_id}/{raw_sub}")
+                        # 🔑 יצירת כל מפתחות החיפוש האפשריים עבור שלוחה זו (למשל: '8', '1/8')
+                        keys_for_row = {raw_sub}
+                        last_seg = raw_sub.split("/")[-1]
+                        keys_for_row.add(last_seg)
+                        keys_for_row.add(f"{dept_id}/{last_seg}")
 
                         if is_personal:
-                            for k in possible_keys:
+                            for k in keys_for_row:
                                 new_personal_lines[dept_id][k] = ManagerLineInfo(
                                     name=name, 
                                     phone=phone, 
                                     dept_id=dept_id,
                                     is_manager=is_manager_role
                                 )
+                            root_logger.info(f"   👤 קו אישי זוהה במחלקה {dept_id}: שלוחה {raw_sub} -> {name} ({phone})")
                         elif is_anonymous:
                             new_dept_general_agents[dept_id].add(phone)
-                            for k in possible_keys:
+                            for k in keys_for_row:
                                 new_anonymous_queues[dept_id].add(k)
                             if phone not in new_agent_to_depts:
                                 new_agent_to_depts[phone] = set()
                             new_agent_to_depts[phone].add(dept_id)
                         else:
+                            # נציג כללי
                             new_dept_general_agents[dept_id].add(phone)
-                            for k in possible_keys:
+                            for k in keys_for_row:
                                 new_general_queues[dept_id].add(k)
                             if phone not in new_agent_to_depts:
                                 new_agent_to_depts[phone] = set()
@@ -385,7 +400,7 @@ class SheetDataManager:
 
             # טעינת לשונית לקוחות
             c_tab_encoded = urllib.parse.quote(CONTACTS_TAB_NAME)
-            url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={c_tab_encoded}"
+            url = f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={c_tab_encoded}&t={int(time.time() * 1000)}"
             try:
                 res = await client.get(url, timeout=10.0, follow_redirects=True)
                 if res.status_code == 200 and not res.text.strip().startswith("/*O_o*/"):
@@ -445,7 +460,7 @@ class SheetDataManager:
                 "3": "הסכמי חנויות", 
                 "4": "עזרה לנזקקים"
             }.get(d_id, f"מחלקה {d_id}")
-            root_logger.info(f"   👥 מחלקה {d_id} ({dept_title}): נציגים כלליים ({len(agents)}) -> {agents} | קווים אישיים ({p_lines})")
+            root_logger.info(f"   👥 מחלקה {d_id} ({dept_title}): נציגים כלליים ({len(agents)}) -> {agents} | מפתחות אישיים ({p_lines})")
 
 
 sheet_data = SheetDataManager(GOOGLE_SHEET_URL)
@@ -1034,7 +1049,6 @@ async def yemot_router(request: Request):
             root_logger.info(f"📢 מציג לנציג {caller_phone}: קיימת הודעה חדשה.")
             return Response("read=t-קיימת הודעה חדשה לשמיעת ההודעה הקישו אחת לכניסה רגילה הקישו שתיים=msg_action,no,1,1,7,Digits", media_type="text/plain; charset=utf-8")
         else:
-            # ✨ שקט מוחלט: אין שיחות ואין הודעות - מעביר מיידית לתפריט הראשי ללא שום השמעה!
             root_logger.info(f"ℹ️ נציג {caller_phone} נכנס לשלוחה 10 - אין שיחות ואין הודעות. מעביר מיידית לתפריט הראשי.")
             return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
@@ -1111,12 +1125,10 @@ async def yemot_router(request: Request):
             content = res_txt.get("contents", "")
             root_logger.info(f"📄 תוכן קובץ {file_prefix}.txt שהתקבל מימות המשיח: {content}")
             
-            # חילוץ ישיר ומדויק: המספר שמופיע אחרי Phone- (מתעלם לחלוטין מ-CustomerDID!)
             m_phone = re.search(r'Phone-([0-9]+)', content)
             if m_phone:
                 caller_phone_found = normalize_phone(m_phone.group(1))
             else:
-                # גיבוי: חיפוש כללי
                 m_back = re.search(r'(?:CallerId|Phone|Caller|caller_id|טלפון)[-=\s]*([0-9]+)', content, re.IGNORECASE)
                 if m_back:
                     caller_phone_found = normalize_phone(m_back.group(1))
@@ -1127,7 +1139,6 @@ async def yemot_router(request: Request):
 
         root_logger.info(f"🎯 אותר מספר המאזין שהשאיר את ההודעה: {caller_phone_found}")
 
-        # א. שלוחה 4/0/1/2: חיוג אנונימי באמצעות ניטוביה (הנציג לא רואה ולא שומע את המספר!)
         if is_ext_4012:
             root_logger.info(f"🎭 מחייג אנונימית למשאיר ההודעה ({caller_phone_found}) דרך ניטוביה בשלוחה 4/0/1/2...")
             nitoviya_ext = f"{target_folder}/nitoviya"
@@ -1142,8 +1153,6 @@ async def yemot_router(request: Request):
             }, timeout=4.0)
 
             return Response(f"id_list_message=t-מעביר אותך לחיוג אנונימי למשאיר ההודעה&go_to_folder=/{nitoviya_ext}", media_type="text/plain; charset=utf-8")
-
-        # ב. שלוחה 4/0/1/1: חיוג רגיל גלוי
         else:
             root_logger.info(f"📞 מחייג ישירות למשאיר ההודעה: {caller_phone_found}")
             spaced_phone = " ".join(caller_phone_found)
@@ -1168,7 +1177,7 @@ async def yemot_router(request: Request):
                 return Response(f"id_list_message=t-אין שיחות ממתינות כעת&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
-    # 6. כניסת מאזינים לתור
+    # 6. כניסת מאזינים לתור (זיהוי קפדני של קווים אישיים!)
     # ==============================================================
     sub_ext = api_extension
     if BASE_FOLDER and sub_ext.startswith(f"{BASE_FOLDER}/"):
@@ -1182,7 +1191,12 @@ async def yemot_router(request: Request):
         await sheet_data.reload_from_sheets()
 
     sub_ext_parts = sub_ext.split("/")
+    
+    # 🔑 יצירת כל מפתחות החיפוש האפשריים: '1/8', '8'
     possible_keys = [sub_ext]
+    if len(sub_ext_parts) >= 2:
+        possible_keys.append(sub_ext_parts[-1])
+        possible_keys.append(f"{sub_ext_parts[0]}/{sub_ext_parts[-1]}")
 
     dept_id = None
     queue_type = None
@@ -1201,7 +1215,7 @@ async def yemot_router(request: Request):
         if d not in depts_to_search:
             depts_to_search.append(d)
 
-    # 1. חיפוש קו אישי
+    # 1. חיפוש קו אישי (עדיפות ראשונה ועליונה!)
     for d_id in depts_to_search:
         p_dict = sheet_data.personal_lines.get(d_id, {})
         for k in possible_keys:
@@ -1214,6 +1228,7 @@ async def yemot_router(request: Request):
                     transfer_msg = "מעביר אותך לשיחה עם המנהל"
                 elif p_info.name:
                     transfer_msg = f"מעביר אותך לשיחה עם {p_info.name}"
+                root_logger.info(f"🎯 זוהה קו אישי עבור {k}: {p_info.name} ({p_info.phone}) במחלקה {dept_id}")
                 break
         if queue_type:
             break
@@ -1229,7 +1244,7 @@ async def yemot_router(request: Request):
                 is_anon = True
                 break
 
-    # 3. חיפוש תור כללי
+    # 3. חיפוש תור כללי מפורש מהגיליון
     if not queue_type:
         for d_id in depts_to_search:
             g_set = sheet_data.general_queue_extensions.get(d_id, set())
@@ -1239,9 +1254,9 @@ async def yemot_router(request: Request):
                 transfer_msg = "מעביר אותך לשיחה עם נציג"
                 break
 
-    # 4. ברירת מחדל לפי תחילית השלוחה
-    if not queue_type and preferred_dept and preferred_dept in sheet_data.dept_general_agents:
-        dept_id = preferred_dept
+    # 4. ברירת מחדל אך ורק אם המאזין חייג ישירות לשלוחה הראשית של המחלקה (1, 2, 3, 4)
+    if not queue_type and sub_ext in ["1", "2", "3", "4"] and sub_ext in sheet_data.dept_general_agents:
+        dept_id = sub_ext
         queue_type = "general"
         transfer_msg = "מעביר אותך לשיחה עם נציג"
 
@@ -1253,7 +1268,6 @@ async def yemot_router(request: Request):
 
     # כניסה ראשונית של המאזין לתור
     async with manager.lock:
-        # ניקוי שיחה קודמת של אותו מאזין בחיוג חוזר
         same_phone_ghosts = [cid for cid, c in manager.waiting_calls.items() if c.phone == caller_phone and cid != call_id]
         for old_cid in same_phone_ghosts:
             old_call = manager.waiting_calls.pop(old_cid, None)
@@ -1277,21 +1291,23 @@ async def yemot_router(request: Request):
             )
             manager.waiting_calls[call_id] = q_call
 
+            # הפעלת צינתוק: אישי -> לנציג היחיד! כללי -> לכל נציגי המחלקה
             if queue_type == "personal":
                 pos = sum(1 for c in manager.waiting_calls.values() if c.target_manager_phone == target_manager_phone)
                 t_key = f"personal_{target_manager_phone}"
                 phone_func = lambda: [target_manager_phone]
+                root_logger.info(f"📱 מפעיל סבב צינתוק אישי עבור הנציג {target_manager_phone} בלבד!")
             else:
                 pos = sum(1 for c in manager.waiting_calls.values() if c.dept_id == dept_id and c.queue_type == "general")
                 t_key = f"general_{dept_id}"
                 phone_func = lambda: list(sheet_data.dept_general_agents.get(dept_id, []))
+                root_logger.info(f"⚡ מפעיל סבב צינתוקים כללי עבור מחלקה {dept_id}")
 
             if t_key not in manager.tzintuk_tasks or manager.tzintuk_tasks[t_key].done():
-                root_logger.info(f"⚡ מפעיל סבב צינתוקים עבור {t_key}")
                 manager.tzintuk_tasks[t_key] = asyncio.create_task(run_tzintuk_loop(t_key, phone_func))
 
             display_caller = f"{customer_name} ({caller_phone})" if customer_name else caller_phone
-            root_logger.info(f"⏳ מאזין {display_caller} נכנס לתור מחלקה {dept_id} דרך שלוחה {api_extension} (מיקום בתור: {pos})")
+            root_logger.info(f"⏳ מאזין {display_caller} נכנס לתור מחלקה {dept_id} (סוג: {queue_type}, שלוחה: {api_extension}, מיקום: {pos})")
             return Response(f"id_list_message=t-מיקומך בתור הוא {pos}&go_to_folder=/{api_extension}", media_type="text/plain; charset=utf-8")
 
     # המתנה רציפה
