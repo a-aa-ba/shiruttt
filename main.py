@@ -36,8 +36,9 @@ YEMOT_TRACKER_FILE_PATH = "ivr2:30/messages_tracker.ini"
 SECONDARY_TZINTUK_REG_FILE_PATH = "ivr2:9/registered_agents.ini"
 YEMOT_STATS_FILE_PATH = "ivr2:stats_data.json"
 
-# כתובת Web App של Google Apps Script לעדכון עמודות הלוג בגיליון השיטס של הנציגים (פועל ברקע כשהמערכת פנויה)
+# כתובת Web App של Google Apps Script לעדכון גיליון הסיכום והלוגים החדש בגוגל שיטס (פועל ברקע כשהמערכת פנויה)
 GOOGLE_SHEETS_LOG_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxGkmYQkgkus00jMg15yFCHIG8SEZ3g_aBOrdv0neu1qLjHi6en63wmQaA87PhycrIo3A/exec"
+SUMMARY_SHEET_TAB_NAME = "סיכום שיחות ולוגים"
 STATS_SYNC_INTERVAL = 300
 
 # ==== הגדרת שלוחות ההודעות למחלקות (לסריקת הודעות חדשות) ====
@@ -543,6 +544,24 @@ class SystemManager:
         self.secondary_known_dids: Set[str] = set()
         self.lock = asyncio.Lock()
 
+    def has_waiting_for_target(self, target_key: str) -> bool:
+        for call in self.waiting_calls.values():
+            if target_key.startswith("personal_") and normalize_phone(call.target_manager_phone or "") == target_key.replace("personal_", ""):
+                return True
+            elif target_key.startswith("general_") and f"general_{call.dept_id}" == target_key:
+                return True
+        return False
+
+    def cancel_tzintuk_if_empty(self, target_key: str):
+        if not self.has_waiting_for_target(target_key):
+            task = self.tzintuk_tasks.pop(target_key, None)
+            if task and not task.done():
+                task.cancel()
+                root_logger.info(f"⏹️ התור התרוקן - סבב הצינתוקים עבור {target_key} הופסק.")
+
+
+manager = SystemManager()
+
 
 def is_registered_agent_phone(phone: str) -> bool:
     clean_p = normalize_phone(phone)
@@ -565,24 +584,6 @@ async def check_is_agent_with_refresh(phone: str) -> bool:
         return is_registered_agent_phone(phone)
     return False
 
-    def has_waiting_for_target(self, target_key: str) -> bool:
-        for call in self.waiting_calls.values():
-            if target_key.startswith("personal_") and normalize_phone(call.target_manager_phone or "") == target_key.replace("personal_", ""):
-                return True
-            elif target_key.startswith("general_") and f"general_{call.dept_id}" == target_key:
-                return True
-        return False
-
-    def cancel_tzintuk_if_empty(self, target_key: str):
-        if not self.has_waiting_for_target(target_key):
-            task = self.tzintuk_tasks.pop(target_key, None)
-            if task and not task.done():
-                task.cancel()
-                root_logger.info(f"⏹️ התור התרוקן - סבב הצינתוקים עבור {target_key} הופסק.")
-
-
-manager = SystemManager()
-
 
 class StatsManager:
     def __init__(self):
@@ -591,13 +592,19 @@ class StatsManager:
         self.missed_calls: int = 0
         self.calls_by_dept: Dict[str, int] = {}
         self.answered_by_dept: Dict[str, int] = {}
+        self.missed_by_dept: Dict[str, int] = {}
         self.personal_calls_by_agent: Dict[str, int] = {}
         self.relevant_calls_by_agent: Dict[str, int] = {}
         self.answered_by_agent: Dict[str, int] = {}
+        self.last_call_by_agent: Dict[str, str] = {}
+        self.call_logs: List[dict] = []
         self.dirty: bool = False
         self.loaded: bool = False
         self.last_sync_ts: float = 0.0
         self.last_updated_str: str = ""
+
+    def _dept_title(self, dept_id: str) -> str:
+        return {"1": "חדר ביגוד", "2": 'חדר צצ"א', "3": "הסכמי חנויות", "4": "עזרה לנזקקים"}.get(str(dept_id), f"מחלקה {dept_id}")
 
     def record_incoming(self, dept_id: str, queue_type: str, target_manager_phone: Optional[str]):
         self.total_calls += 1
@@ -614,16 +621,63 @@ class StatsManager:
                     self.relevant_calls_by_agent[clean_ag] = self.relevant_calls_by_agent.get(clean_ag, 0) + 1
         self.dirty = True
 
-    def record_answered(self, dept_id: str, agent_phone: str):
+    def record_answered(self, dept_id: str, agent_phone: str, call_record: Optional[dict] = None):
         self.answered_calls += 1
         self.answered_by_dept[dept_id] = self.answered_by_dept.get(dept_id, 0) + 1
         clean_ag = normalize_phone(agent_phone)
+        now_dt = get_israel_now()
+        date_str = (call_record or {}).get("date_str") or now_dt.strftime("%d/%m/%Y")
+        time_str = (call_record or {}).get("time_str") or now_dt.strftime("%H:%M")
+
         if clean_ag:
             self.answered_by_agent[clean_ag] = self.answered_by_agent.get(clean_ag, 0) + 1
+            self.last_call_by_agent[clean_ag] = f"{date_str} {time_str}"
+
+        rec = call_record or {}
+        is_anon = bool(rec.get("is_anonymous", False))
+        q_type = rec.get("queue_type", "general")
+        q_label = "אישי" if q_type == "personal" else ("אנונימי" if is_anon else "כללי")
+        self.call_logs.append({
+            "date_str": date_str,
+            "time_str": time_str,
+            "status": "נענתה",
+            "agent_name": rec.get("agent_name") or sheet_data.agent_names.get(clean_ag, "ללא שם"),
+            "agent_phone": clean_ag,
+            "dept_id": str(dept_id),
+            "dept_name": self._dept_title(dept_id),
+            "queue_type": q_label,
+            "room": str(rec.get("room", "")),
+            "caller_name": rec.get("caller_name") or ("חסוי" if is_anon else ""),
+            "caller_phone": "חסוי" if is_anon else str(rec.get("caller_phone", "")),
+        })
+        if len(self.call_logs) > 300:
+            self.call_logs = self.call_logs[-300:]
         self.dirty = True
 
-    def record_missed(self, dept_id: str):
+    def record_missed(self, dept_id: str, call_info: Optional[QueuedCall] = None):
         self.missed_calls += 1
+        self.missed_by_dept[dept_id] = self.missed_by_dept.get(dept_id, 0) + 1
+        now_dt = get_israel_now()
+        if call_info is not None:
+            is_anon = bool(call_info.is_anonymous)
+            q_label = "אישי" if call_info.queue_type == "personal" else ("אנונימי" if is_anon else "כללי")
+            target_ag = normalize_phone(call_info.target_manager_phone or "") if call_info.queue_type == "personal" else ""
+            ag_name = sheet_data.agent_names.get(target_ag, "") if target_ag else "-"
+            self.call_logs.append({
+                "date_str": now_dt.strftime("%d/%m/%Y"),
+                "time_str": now_dt.strftime("%H:%M"),
+                "status": "נותקה ללא מענה",
+                "agent_name": ag_name or "-",
+                "agent_phone": target_ag or "-",
+                "dept_id": str(dept_id),
+                "dept_name": self._dept_title(dept_id),
+                "queue_type": q_label,
+                "room": "-",
+                "caller_name": call_info.caller_name or ("חסוי" if is_anon else ""),
+                "caller_phone": "חסוי" if is_anon else str(call_info.phone or ""),
+            })
+            if len(self.call_logs) > 300:
+                self.call_logs = self.call_logs[-300:]
         self.dirty = True
 
     def to_dict(self) -> dict:
@@ -633,9 +687,12 @@ class StatsManager:
             "missed_calls": self.missed_calls,
             "calls_by_dept": self.calls_by_dept,
             "answered_by_dept": self.answered_by_dept,
+            "missed_by_dept": self.missed_by_dept,
             "personal_calls_by_agent": self.personal_calls_by_agent,
             "relevant_calls_by_agent": self.relevant_calls_by_agent,
             "answered_by_agent": self.answered_by_agent,
+            "last_call_by_agent": self.last_call_by_agent,
+            "call_logs": self.call_logs[-300:],
             "last_updated": self.last_updated_str,
         }
 
@@ -648,6 +705,7 @@ class StatsManager:
         for target_dict, key in (
             (self.calls_by_dept, "calls_by_dept"),
             (self.answered_by_dept, "answered_by_dept"),
+            (self.missed_by_dept, "missed_by_dept"),
             (self.personal_calls_by_agent, "personal_calls_by_agent"),
             (self.relevant_calls_by_agent, "relevant_calls_by_agent"),
             (self.answered_by_agent, "answered_by_agent"),
@@ -656,6 +714,14 @@ class StatsManager:
             if isinstance(src, dict):
                 for k, v in src.items():
                     target_dict[k] = target_dict.get(k, 0) + int(v or 0)
+        saved_last = saved.get("last_call_by_agent", {})
+        if isinstance(saved_last, dict):
+            for k, v in saved_last.items():
+                if v and k not in self.last_call_by_agent:
+                    self.last_call_by_agent[k] = str(v)
+        saved_logs = saved.get("call_logs", [])
+        if isinstance(saved_logs, list) and saved_logs:
+            self.call_logs = (saved_logs + self.call_logs)[-300:]
         if not self.last_updated_str:
             self.last_updated_str = str(saved.get("last_updated", ""))
 
@@ -707,12 +773,16 @@ class StatsManager:
                 if p not in all_dept_agents:
                     all_dept_agents.append(p)
             reg_count = sum(1 for p in all_dept_agents if p in manager.registered_tzintuk_agents)
+            d_calls = self.calls_by_dept.get(d_id, 0)
+            d_ans = self.answered_by_dept.get(d_id, 0)
+            d_miss = self.missed_by_dept.get(d_id, max(0, d_calls - d_ans))
             dept_rows.append({
                 "dept_id": d_id,
                 "dept_name": dept_titles.get(d_id, f"מחלקה {d_id}"),
                 "tab_name": DEPARTMENT_TABS_MAPPING.get(d_id, ""),
-                "calls": self.calls_by_dept.get(d_id, 0),
-                "answered": self.answered_by_dept.get(d_id, 0),
+                "calls": d_calls,
+                "answered": d_ans,
+                "missed": d_miss,
                 "agents_count": len(all_dept_agents),
                 "tzintuk_registered_count": reg_count,
             })
@@ -733,6 +803,9 @@ class StatsManager:
                 if any(normalize_phone(info.phone) == p for info in p_dict.values()):
                     depts.add(d_id)
             dept_labels = ", ".join(dept_titles.get(d, d) for d in sorted(depts)) or "כללי"
+            rel_calls = self.relevant_calls_by_agent.get(p, 0)
+            ans_calls = self.answered_by_agent.get(p, 0)
+            ans_rate = f"{round((ans_calls / rel_calls) * 100)}%" if rel_calls > 0 else "0%"
             agent_rows.append({
                 "name": sheet_data.agent_names.get(p, "ללא שם"),
                 "phone": p,
@@ -740,36 +813,98 @@ class StatsManager:
                 "dept_ids": sorted(depts),
                 "tab_names": [DEPARTMENT_TABS_MAPPING[d] for d in sorted(depts) if d in DEPARTMENT_TABS_MAPPING],
                 "personal_calls": self.personal_calls_by_agent.get(p, 0),
-                "total_relevant_calls": self.relevant_calls_by_agent.get(p, 0),
-                "answered_calls": self.answered_by_agent.get(p, 0),
+                "total_relevant_calls": rel_calls,
+                "answered_calls": ans_calls,
+                "answer_rate": ans_rate,
                 "tzintuk_registered": "כן" if p in manager.registered_tzintuk_agents else "לא",
+                "last_call_at": self.last_call_by_agent.get(p, "-"),
             })
+
+        overall_rate = f"{round((self.answered_calls / self.total_calls) * 100)}%" if self.total_calls > 0 else "0%"
+        recent_logs = list(reversed(self.call_logs[-200:]))
+
+        sheet_rows: List[List[str]] = [
+            ["סיכום כללי למערכת כולה", "", "", "", "", "", "", "", "", ""],
+            ["מדד", "ערך", "", "", "", "", "", "", "", ""],
+            ["עדכון אחרון", now_str, "", "", "", "", "", "", "", ""],
+            ["סה\"כ שיחות נכנסות במערכת", str(self.total_calls), "", "", "", "", "", "", "", ""],
+            ["שיחות שנענו", str(self.answered_calls), "", "", "", "", "", "", "", ""],
+            ["שיחות שנותקו ללא מענה", str(self.missed_calls), "", "", "", "", "", "", "", ""],
+            ["אחוז מענה כללי", overall_rate, "", "", "", "", "", "", "", ""],
+            ["שיחות ממתינות כעת", str(len(manager.waiting_calls)), "", "", "", "", "", "", "", ""],
+            ["סה\"כ נציגים רשומים לצינתוקים", str(len(manager.registered_tzintuk_agents)), "", "", "", "", "", "", "", ""],
+            ["", "", "", "", "", "", "", "", "", ""],
+            ["סיכום לפי מחלקה / שלוחה", "", "", "", "", "", "", "", "", ""],
+            ["מחלקה", "שלוחה", "סה\"כ שיחות", "שיחות שנענו", "שיחות שלא נענו", "כמות נציגים", "רשומים לצינתוקים", "", "", ""],
+        ]
+        for row in dept_rows:
+            sheet_rows.append([
+                row["dept_name"],
+                f"שלוחה {row['dept_id']}",
+                str(row["calls"]),
+                str(row["answered"]),
+                str(row["missed"]),
+                str(row["agents_count"]),
+                str(row["tzintuk_registered_count"]),
+                "", "", ""
+            ])
+
+        sheet_rows.extend([
+            ["", "", "", "", "", "", "", "", "", ""],
+            ["סיכום לכל נציג", "", "", "", "", "", "", "", "", ""],
+            ["שם נציג", "טלפון", "מחלקות", "שיחות בקו אישי", "סה\"כ שיחות משויכות", "שיחות שנענו ע\"י נציג", "אחוז מענה", "רשום לצינתוקים", "שיחה אחרונה", ""],
+        ])
+        for row in agent_rows:
+            sheet_rows.append([
+                row["name"],
+                row["phone"],
+                row["depts"],
+                str(row["personal_calls"]),
+                str(row["total_relevant_calls"]),
+                str(row["answered_calls"]),
+                row["answer_rate"],
+                row["tzintuk_registered"],
+                row["last_call_at"],
+                "",
+            ])
+
+        sheet_rows.extend([
+            ["", "", "", "", "", "", "", "", "", ""],
+            ["לוג שיחות הנציגים והמערכת (אחרונות למעלה)", "", "", "", "", "", "", "", "", ""],
+            ["תאריך", "שעה", "סטטוס", "שם נציג", "טלפון נציג", "מחלקה", "סוג תור", "חדר", "שם מאזין", "טלפון מאזין"],
+        ])
+        for log_entry in recent_logs:
+            sheet_rows.append([
+                log_entry.get("date_str", ""),
+                log_entry.get("time_str", ""),
+                log_entry.get("status", ""),
+                log_entry.get("agent_name", ""),
+                log_entry.get("agent_phone", ""),
+                log_entry.get("dept_name", ""),
+                log_entry.get("queue_type", ""),
+                log_entry.get("room", ""),
+                log_entry.get("caller_name", ""),
+                log_entry.get("caller_phone", ""),
+            ])
 
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["קטגוריה", "שם / פירוט", "שלוחה / טלפון", "כמות שיחות / קו אישי", "שיחות שנענו / משויכות", "נציגים / נענו ע\"י נציג", "רשום לצינתוקים"])
-        writer.writerow(["סיכום כללי", "עדכון אחרון", now_str, "", "", "", ""])
-        writer.writerow(["סיכום כללי", "סה\"כ שיחות נכנסות", "", self.total_calls, "", "", ""])
-        writer.writerow(["סיכום כללי", "שיחות שנענו", "", self.answered_calls, "", "", ""])
-        writer.writerow(["סיכום כללי", "שיחות שנותקו ללא מענה", "", self.missed_calls, "", "", ""])
-        writer.writerow(["סיכום כללי", "שיחות ממתינות כעת", "", len(manager.waiting_calls), "", "", ""])
-        writer.writerow(["סיכום כללי", "סה\"כ נציגים רשומים לצינתוקים", "", "", "", "", len(manager.registered_tzintuk_agents)])
-
-        for row in dept_rows:
-            writer.writerow(["שלוחה / מחלקה", row["dept_name"], f"שלוחה {row['dept_id']}", row["calls"], row["answered"], row["agents_count"], row["tzintuk_registered_count"]])
-
-        for row in agent_rows:
-            writer.writerow(["נציג", row["name"], f"{row['phone']} ({row['depts']})", row["personal_calls"], row["total_relevant_calls"], row["answered_calls"], row["tzintuk_registered"]])
+        for s_row in sheet_rows:
+            writer.writerow(s_row)
 
         summary = {
+            "sheet_tab_name": SUMMARY_SHEET_TAB_NAME,
             "last_updated": now_str,
             "total_calls": self.total_calls,
             "answered_calls": self.answered_calls,
             "missed_calls": self.missed_calls,
+            "overall_answer_rate": overall_rate,
             "waiting_now": len(manager.waiting_calls),
             "tzintuk_registered_total": len(manager.registered_tzintuk_agents),
             "departments": dept_rows,
             "agents": agent_rows,
+            "call_logs": recent_logs,
+            "sheet_rows": sheet_rows,
         }
         return summary, "\ufeff" + output.getvalue()
 
@@ -1255,7 +1390,7 @@ async def bridge_call_for_agent(caller_phone: str, agent_name: str, selected_cal
     }
     manager.call_history[selected_call.call_id] = call_record
     manager.last_call_by_phone[selected_call.phone] = call_record
-    stats_manager.record_answered(selected_call.dept_id, caller_phone)
+    stats_manager.record_answered(selected_call.dept_id, caller_phone, call_record=call_record)
 
     asyncio.create_task(
         append_to_yemot_log(
@@ -1296,7 +1431,7 @@ async def background_cleanup_loop():
                         manager.last_seen.pop(cid, None)
                         t_key = f"personal_{normalize_phone(call.target_manager_phone or '')}" if call.queue_type == "personal" else f"general_{call.dept_id}"
                         manager.cancel_tzintuk_if_empty(t_key)
-                        stats_manager.record_missed(call.dept_id)
+                        stats_manager.record_missed(call.dept_id, call_info=call)
 
             if manager.pending_secondary_transfers or manager.pending_secondary_anon_transfers:
                 async with manager.lock:
@@ -1364,16 +1499,21 @@ async def load_system_dids():
 async def push_stats_to_google_sheets(summary: dict, csv_content: str):
     if not GOOGLE_SHEETS_LOG_WEBHOOK_URL:
         return
+    if manager.waiting_calls or manager.tzintuk_tasks:
+        return
     payload = {
+        "sheet_name": SUMMARY_SHEET_TAB_NAME,
+        "sheet_rows": summary.get("sheet_rows", []),
         "summary": summary,
         "departments": summary.get("departments", []),
         "agents": summary.get("agents", []),
+        "call_logs": summary.get("call_logs", []),
         "csv": csv_content,
     }
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         res = await client.post(GOOGLE_SHEETS_LOG_WEBHOOK_URL, json=payload)
         if res.status_code == 200:
-            root_logger.info("📊 עמודות הלוג עודכנו בהצלחה בגיליון Google Sheets של הנציגים.")
+            root_logger.info(f"📊 גיליון הסיכום והלוגים ('{SUMMARY_SHEET_TAB_NAME}') עודכן בהצלחה ב-Google Sheets.")
 
 
 async def background_stats_loop():
@@ -1391,11 +1531,13 @@ async def background_stats_loop():
                 continue
 
             await load_tzintuk_registered_agents()
+            if manager.waiting_calls or manager.tzintuk_tasks:
+                continue
 
             summary, csv_content = stats_manager.build_csv_and_summary()
             await stats_manager.save_to_yemot()
 
-            if GOOGLE_SHEETS_LOG_WEBHOOK_URL:
+            if GOOGLE_SHEETS_LOG_WEBHOOK_URL and not manager.waiting_calls and not manager.tzintuk_tasks:
                 await push_stats_to_google_sheets(summary, csv_content)
 
             stats_manager.dirty = False
@@ -1435,6 +1577,44 @@ async def stats_endpoint(format: str = "json"):
     if format == "csv":
         return Response(content=csv_content, media_type="text/csv; charset=utf-8")
     return Response(content=json.dumps(summary, ensure_ascii=False, indent=2), media_type="application/json; charset=utf-8")
+
+
+@app.get("/apps-script")
+async def apps_script_endpoint():
+    gs_code = f'''function doPost(e) {{
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {{
+    var data = JSON.parse(e.postData.contents);
+    var sheetName = data.sheet_name || "{SUMMARY_SHEET_TAB_NAME}";
+    var rows = data.sheet_rows || [];
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName(sheetName);
+    if (!sheet) {{
+      sheet = ss.insertSheet(sheetName);
+    }}
+    sheet.setRightToLeft(true);
+    sheet.clear();
+    if (rows.length > 0) {{
+      var numCols = rows[0].length;
+      sheet.getRange(1, 1, rows.length, numCols).setValues(rows);
+      for (var i = 0; i < rows.length; i++) {{
+        var firstCell = String(rows[i][0] || "");
+        if (firstCell.indexOf("סיכום") === 0 || firstCell.indexOf("לוג שיחות") === 0) {{
+          sheet.getRange(i + 1, 1, 1, numCols).setFontWeight("bold").setBackground("#d9ead3");
+        }} else if (firstCell === "מדד" || firstCell === "מחלקה" || firstCell === "שם נציג" || firstCell === "תאריך") {{
+          sheet.getRange(i + 1, 1, 1, numCols).setFontWeight("bold").setBackground("#cfe2f3");
+        }}
+      }}
+      sheet.autoResizeColumns(1, numCols);
+    }}
+    return ContentService.createTextOutput(JSON.stringify({{ status: "ok" }}))
+      .setMimeType(ContentService.MimeType.JSON);
+  }} finally {{
+    lock.releaseLock();
+  }}
+}}'''
+    return Response(content=gs_code, media_type="text/plain; charset=utf-8")
 
 
 @app.api_route("/", methods=["GET", "POST"])
@@ -1520,7 +1700,7 @@ async def yemot_router(request: Request):
                 root_logger.info(f"📴 מאזין {display_name} ניתק את השיחה ויצא מהתור.")
                 t_key = f"personal_{normalize_phone(removed_call.target_manager_phone or '')}" if removed_call.queue_type == "personal" else f"general_{removed_call.dept_id}"
                 manager.cancel_tzintuk_if_empty(t_key)
-                stats_manager.record_missed(removed_call.dept_id)
+                stats_manager.record_missed(removed_call.dept_id, call_info=removed_call)
 
         return Response("noop=yes", media_type="text/plain; charset=utf-8")
 
