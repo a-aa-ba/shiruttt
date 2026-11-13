@@ -1039,10 +1039,10 @@ async def mark_agent_tzintuk_registered(agent_phone: str):
         root_logger.error(f"❌ שגיאה בשמירת רישום צינתוק לנציג {clean_phone}: {e}")
 
 
-async def prepare_agent_tzintuk_folder(agent_phone: str, end_goto: str = "/10") -> str:
+async def prepare_agent_tzintuk_folder(agent_phone: str, end_goto: str = "/") -> str:
     clean_phone = normalize_phone(agent_phone)
     parent_9 = build_path("9")
-    tz_folder = build_path(f"9/{clean_phone}")
+    tz_folder = build_path("9/C")
     ext_content = (
         "type=tzintuk\n"
         f"list_tzintuk={clean_phone}\n"
@@ -1081,9 +1081,9 @@ async def prepare_agent_tzintuk_folder(agent_phone: str, end_goto: str = "/10") 
         if not res_retry or res_retry.get("responseStatus") != "OK":
             root_logger.error(f"❌ יצירת שלוחת צינתוקים {tz_folder} נכשלה: {res_retry}")
         else:
-            root_logger.info(f"✅ הוגדרה שלוחת רישום צינתוקים {tz_folder} (סיום -> {end_goto})")
+            root_logger.info(f"✅ הוגדרה שלוחת רישום צינתוקים {tz_folder} עבור {clean_phone} (tzintuk_end={end_goto})")
     else:
-        root_logger.info(f"✅ הוגדרה שלוחת רישום צינתוקים {tz_folder} (סיום -> {end_goto})")
+        root_logger.info(f"✅ הוגדרה שלוחת רישום צינתוקים {tz_folder} עבור {clean_phone} (tzintuk_end={end_goto})")
     return f"/{tz_folder}"
 
 
@@ -1609,10 +1609,8 @@ async def yemot_router(request: Request):
             if not await check_is_agent_with_refresh(caller_phone):
                 root_logger.warning(f"⛔ טלפון {caller_phone} ניסה להיכנס לשלוחה 9 במערכת החדשה אך אינו נציג - מעביר לשלוחת ניתוק (/1).")
                 return Response("go_to_folder=/1", media_type="text/plain; charset=utf-8")
-            end_target = f"/{build_path('10')}"
             manager.just_sent_to_9.add(call_id)
-        else:
-            end_target = get_base_root_dest()
+        end_target = get_base_root_dest()
         dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=end_target)
         root_logger.info(f"⚙️ כניסה לשלוחה 9 (ניהול צינתוקים) עבור {caller_phone} -> מעביר ל-{dest_9}")
         return Response(f"go_to_folder={dest_9}", media_type="text/plain; charset=utf-8")
@@ -1660,7 +1658,7 @@ async def yemot_router(request: Request):
             elif call_action is None and idle_action is None:
                 if not await is_agent_tzintuk_registered(caller_phone):
                     manager.pending_tzintuk_reg_calls[call_id] = caller_phone
-                    dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=f"/{gateway_ext}")
+                    dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=get_base_root_dest())
                     root_logger.info(f"📋 כניסה ראשונה לנציג {caller_phone} במערכת החדשה - מעביר לשלוחת רישום צינתוקים {dest_9}")
                     return Response(f"go_to_folder={dest_9}", media_type="text/plain; charset=utf-8")
 
@@ -1680,7 +1678,7 @@ async def yemot_router(request: Request):
                             return Response("id_list_message=t-השיחה כבר אינה ממתינה בתור&go_to_folder=/1", media_type="text/plain; charset=utf-8")
                 elif call_action == "9":
                     manager.just_sent_to_9.add(call_id)
-                    dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=f"/{gateway_ext}")
+                    dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=get_base_root_dest())
                     root_logger.info(f"⚙️ נציג {caller_phone} עובר מהשיחה לניהול קבלת הצינתוקים -> {dest_9}")
                     return Response(f"go_to_folder={dest_9}", media_type="text/plain; charset=utf-8")
                 else:
@@ -1691,7 +1689,7 @@ async def yemot_router(request: Request):
                 root_logger.info(f"🔘 נציג {caller_phone} הקיש [{idle_action}] בתפריט ללא שיחות במערכת החדשה")
                 if idle_action == "9":
                     manager.just_sent_to_9.add(call_id)
-                    dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=f"/{gateway_ext}")
+                    dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=get_base_root_dest())
                     root_logger.info(f"⚙️ נציג {caller_phone} עובר לניהול קבלת הצינתוקים -> {dest_9}")
                     return Response(f"go_to_folder={dest_9}", media_type="text/plain; charset=utf-8")
                 else:
@@ -1733,7 +1731,7 @@ async def yemot_router(request: Request):
         elif call_action is None and idle_action is None and msg_action is None and not action:
             if not await is_agent_tzintuk_registered(caller_phone):
                 manager.pending_tzintuk_reg_calls[call_id] = caller_phone
-                dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=f"/{gateway_ext}")
+                dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=get_base_root_dest())
                 root_logger.info(f"📋 כניסה ראשונה לנציג {caller_phone} - מעביר לשלוחת רישום צינתוקים {dest_9}")
                 return Response(f"go_to_folder={dest_9}", media_type="text/plain; charset=utf-8")
 
@@ -1758,7 +1756,7 @@ async def yemot_router(request: Request):
                         return Response("id_list_message=t-השיחה כבר אינה ממתינה בתור&hangup=yes", media_type="text/plain; charset=utf-8")
             elif call_action == "9":
                 manager.just_sent_to_9.add(call_id)
-                dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=f"/{gateway_ext}")
+                dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=get_base_root_dest())
                 root_logger.info(f"⚙️ נציג {caller_phone} עובר לניהול קבלת הצינתוקים -> {dest_9}")
                 return Response(f"go_to_folder={dest_9}", media_type="text/plain; charset=utf-8")
             else:
@@ -1769,7 +1767,7 @@ async def yemot_router(request: Request):
             root_logger.info(f"🔘 נציג {caller_phone} הקיש [{idle_action}] בתפריט ללא שיחות")
             if idle_action == "9":
                 manager.just_sent_to_9.add(call_id)
-                dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=f"/{gateway_ext}")
+                dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=get_base_root_dest())
                 root_logger.info(f"⚙️ נציג {caller_phone} עובר לניהול קבלת הצינתוקים -> {dest_9}")
                 return Response(f"go_to_folder={dest_9}", media_type="text/plain; charset=utf-8")
             else:
