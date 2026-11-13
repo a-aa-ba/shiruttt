@@ -20,8 +20,8 @@ import json
 YEMOT_API_TOKEN = "0775311511:124578"
 
 # הגדרות הקו השני (המערכת האחרת: שלוחות השיחות, הצינתוקים ומענה הנציגים):
-SECONDARY_YEMOT_API_TOKEN = "0774360613:123456"
-SECONDARY_SYSTEM_NUMBER = "0774360613"
+SECONDARY_YEMOT_API_TOKEN = "0773460613:123456"
+SECONDARY_SYSTEM_NUMBER = "0773460613"
 
 # תיקיית הבסיס - שלוחה ראשית (ריק)
 BASE_FOLDER = ""
@@ -37,7 +37,7 @@ SECONDARY_TZINTUK_REG_FILE_PATH = "ivr2:9/registered_agents.ini"
 YEMOT_STATS_FILE_PATH = "ivr2:stats_data.json"
 
 # כתובת Web App של Google Apps Script לעדכון עמודות הלוג בגיליון השיטס של הנציגים (פועל ברקע כשהמערכת פנויה)
-GOOGLE_SHEETS_LOG_WEBHOOK_URL = os.environ.get("GOOGLE_SHEETS_LOG_WEBHOOK_URL", "") or os.environ.get("GOOGLE_STATS_WEBHOOK_URL", "")
+GOOGLE_SHEETS_LOG_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxGkmYQkgkus00jMg15yFCHIG8SEZ3g_aBOrdv0neu1qLjHi6en63wmQaA87PhycrIo3A/exec"
 STATS_SYNC_INTERVAL = 300
 
 # ==== הגדרת שלוחות ההודעות למחלקות (לסריקת הודעות חדשות) ====
@@ -293,6 +293,7 @@ class SheetDataManager:
         self.agent_to_depts: Dict[str, Set[str]] = {}
         self.agent_names: Dict[str, str] = {}
         self.customer_contacts: Dict[str, str] = {}
+        self.last_reload_ts: float = 0.0
 
     def _extract_sheet_id(self, url: str) -> str:
         match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
@@ -493,6 +494,7 @@ class SheetDataManager:
         self.agent_to_depts = new_agent_to_depts
         self.agent_names = new_agent_names
         self.customer_contacts = new_customer_contacts
+        self.last_reload_ts = time.time()
 
         # ספירת קווים אישיים מדויקת (לפי כמות נציגים/שלוחות מקוריות ולא לפי כמות המפתחות)
         total_p = sum(len(set(info.phone for info in lines.values())) for lines in self.personal_lines.values())
@@ -536,9 +538,32 @@ class SystemManager:
         self.registered_tzintuk_agents: Set[str] = set()
         self.tzintuk_reg_loaded: bool = False
         self.pending_tzintuk_reg_calls: Dict[str, str] = {}
+        self.just_sent_to_9: Set[str] = set()
         self.primary_known_dids: Set[str] = set()
         self.secondary_known_dids: Set[str] = set()
         self.lock = asyncio.Lock()
+
+
+def is_registered_agent_phone(phone: str) -> bool:
+    clean_p = normalize_phone(phone)
+    if not clean_p:
+        return False
+    if clean_p in sheet_data.agent_names or clean_p in sheet_data.agent_to_depts:
+        return True
+    for dept_dict in sheet_data.personal_lines.values():
+        for info in dept_dict.values():
+            if normalize_phone(info.phone) == clean_p:
+                return True
+    return False
+
+
+async def check_is_agent_with_refresh(phone: str) -> bool:
+    if is_registered_agent_phone(phone):
+        return True
+    if (time.time() - sheet_data.last_reload_ts) > 60:
+        await sheet_data.reload_from_sheets()
+        return is_registered_agent_phone(phone)
+    return False
 
     def has_waiting_for_target(self, target_key: str) -> bool:
         for call in self.waiting_calls.values():
@@ -1016,13 +1041,15 @@ async def mark_agent_tzintuk_registered(agent_phone: str):
 
 async def prepare_agent_tzintuk_folder(agent_phone: str, end_goto: str = "/10") -> str:
     clean_phone = normalize_phone(agent_phone)
+    parent_9 = build_path("9")
     tz_folder = build_path(f"9/{clean_phone}")
     ext_content = (
         "type=tzintuk\n"
         f"list_tzintuk={clean_phone}\n"
         f"tzintuk_end={end_goto}\n"
     )
-    await yemot_api_request(
+    tok = get_secondary_token()
+    res_upload = await yemot_api_request(
         "UploadTextFile",
         method="POST",
         data={
@@ -1030,8 +1057,33 @@ async def prepare_agent_tzintuk_folder(agent_phone: str, end_goto: str = "/10") 
             "contents": ext_content
         },
         timeout=4.0,
-        token=get_secondary_token()
+        token=tok
     )
+    if not res_upload or res_upload.get("responseStatus") != "OK":
+        root_logger.warning(f"⚠️ העלאת ext.ini עבור {tz_folder} החזירה {res_upload} - יוצר תיקיות דרך UpdateExtension...")
+        await yemot_api_request("UpdateExtension", params={"path": f"ivr2:{parent_9}"}, timeout=4.0, token=tok)
+        await yemot_api_request("UpdateExtension", params={
+            "path": f"ivr2:{tz_folder}",
+            "type": "tzintuk",
+            "list_tzintuk": clean_phone,
+            "tzintuk_end": end_goto,
+        }, timeout=4.0, token=tok)
+        res_retry = await yemot_api_request(
+            "UploadTextFile",
+            method="POST",
+            data={
+                "what": f"ivr2:{tz_folder}/ext.ini",
+                "contents": ext_content
+            },
+            timeout=4.0,
+            token=tok
+        )
+        if not res_retry or res_retry.get("responseStatus") != "OK":
+            root_logger.error(f"❌ יצירת שלוחת צינתוקים {tz_folder} נכשלה: {res_retry}")
+        else:
+            root_logger.info(f"✅ הוגדרה שלוחת רישום צינתוקים {tz_folder} (סיום -> {end_goto})")
+    else:
+        root_logger.info(f"✅ הוגדרה שלוחת רישום צינתוקים {tz_folder} (סיום -> {end_goto})")
     return f"/{tz_folder}"
 
 
@@ -1446,6 +1498,7 @@ async def yemot_router(request: Request):
             manager.waiting_events.pop(call_id, None)
             manager.waiting_destinations.pop(call_id, None)
             manager.pending_tzintuk_reg_calls.pop(call_id, None)
+            manager.just_sent_to_9.discard(call_id)
             if caller_phone in manager.busy_agents:
                 manager.busy_agents.discard(caller_phone)
 
@@ -1492,12 +1545,17 @@ async def yemot_router(request: Request):
         return Response(f"id_list_message=t-מעביר אותך לשיחה&go_to_folder={destination}", media_type="text/plain; charset=utf-8")
 
     # 2.5 הגעת מאזין או נציג למערכת השנייה (הקו השני)
+    if is_secondary_configured() and is_from_secondary and api_extension in ("1", build_path("1")):
+        return Response("hangup=yes", media_type="text/plain; charset=utf-8")
+
     what_file_early = params.get("what") or params.get("file") or params.get("filename") or ""
     is_secondary_admin_ext = api_extension in (
         "9", build_path("9"),
         "30", "30/0", build_path("30"), build_path("30/0"),
         "4/0/1/1", "4/0/1/1/0", "4/0/1/2", "4/0/1/2/0"
     ) or api_extension.startswith(("9/", f"{build_path('9')}/")) or api_extension.endswith(("/30", "/30/0", "4/0/1/1", "4/0/1/1/0", "4/0/1/2", "4/0/1/2/0")) or bool(what_file_early)
+    if is_from_secondary and api_extension in ("1", build_path("1")):
+        is_secondary_admin_ext = True
 
     is_secondary_agent_ext = is_secondary_admin_ext or api_extension in (
         "10", build_path("10"),
@@ -1528,21 +1586,15 @@ async def yemot_router(request: Request):
             return Response(f"go_to_folder={matched_dest}", media_type="text/plain; charset=utf-8")
 
         if not is_secondary_agent_ext:
-            is_agent_sec = caller_phone in sheet_data.agent_names or caller_phone in sheet_data.agent_to_depts
-            if not is_agent_sec:
-                for dept_dict in sheet_data.personal_lines.values():
-                    for info in dept_dict.values():
-                        if normalize_phone(info.phone) == caller_phone:
-                            is_agent_sec = True
-                            break
+            is_agent_sec = await check_is_agent_with_refresh(caller_phone)
 
             if is_agent_sec:
                 root_logger.info(f"👤 נציג {caller_phone} נכנס למערכת השנייה - מפנה מיד לשלוחה 10")
                 return Response("go_to_folder=/10", media_type="text/plain; charset=utf-8")
 
             if is_from_secondary:
-                root_logger.warning(f"⚠️ מאזין {caller_phone or 'אנונימי'} נכנס למערכת השנייה ללא שידוך ממתין.")
-                return Response("id_list_message=t-אין שיחה ממתינה עבורך&hangup=yes", media_type="text/plain; charset=utf-8")
+                root_logger.warning(f"⚠️ מתקשר {caller_phone or 'אנונימי'} חייג ישירות למערכת השנייה ללא העברה מהשרת ואינו נציג - מעביר לשלוחת ניתוק (/1).")
+                return Response("go_to_folder=/1", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
     # 2.9 שלוחת רישום וניהול קבלת צינתוקים (שלוחה 9)
@@ -1550,8 +1602,18 @@ async def yemot_router(request: Request):
     tzintuk_reg_ext = build_path("9")
     if api_extension == tzintuk_reg_ext or api_extension == "9":
         if not caller_phone:
+            if is_secondary_configured() and is_from_secondary:
+                return Response("go_to_folder=/1", media_type="text/plain; charset=utf-8")
             return Response("id_list_message=t-מספר הטלפון אינו מזוהה&hangup=yes", media_type="text/plain; charset=utf-8")
-        dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=get_base_root_dest())
+        if is_secondary_configured() and is_from_secondary:
+            if not await check_is_agent_with_refresh(caller_phone):
+                root_logger.warning(f"⛔ טלפון {caller_phone} ניסה להיכנס לשלוחה 9 במערכת החדשה אך אינו נציג - מעביר לשלוחת ניתוק (/1).")
+                return Response("go_to_folder=/1", media_type="text/plain; charset=utf-8")
+            end_target = f"/{build_path('10')}"
+            manager.just_sent_to_9.add(call_id)
+        else:
+            end_target = get_base_root_dest()
+        dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=end_target)
         root_logger.info(f"⚙️ כניסה לשלוחה 9 (ניהול צינתוקים) עבור {caller_phone} -> מעביר ל-{dest_9}")
         return Response(f"go_to_folder={dest_9}", media_type="text/plain; charset=utf-8")
 
@@ -1561,19 +1623,13 @@ async def yemot_router(request: Request):
     gateway_ext = build_path("10")
     if api_extension == gateway_ext or api_extension == "10":
         manager.busy_agents.discard(caller_phone)
-        
-        is_agent = caller_phone in sheet_data.agent_names or caller_phone in sheet_data.agent_to_depts
-        if not is_agent:
-            for dept_dict in sheet_data.personal_lines.values():
-                for info in dept_dict.values():
-                    if normalize_phone(info.phone) == caller_phone:
-                        is_agent = True
-                        break
+
+        is_agent = await check_is_agent_with_refresh(caller_phone)
 
         if not is_agent:
-            root_logger.warning(f"⛔ טלפון {caller_phone} ניסה להיכנס לשלוחה 10 אך אינו מוגדר כנציג בשיטס!")
+            root_logger.warning(f"⛔ טלפון {caller_phone or 'אנונימי'} ניסה להיכנס לשלוחה 10 אך אינו מוגדר כנציג בשיטס!")
             if is_secondary_configured() and is_from_secondary:
-                return Response("id_list_message=t-אינך מוגדר כנציג&hangup=yes", media_type="text/plain; charset=utf-8")
+                return Response("go_to_folder=/1", media_type="text/plain; charset=utf-8")
             return Response(f"go_to_folder={get_base_root_dest()}", media_type="text/plain; charset=utf-8")
 
         agent_name = sheet_data.agent_names.get(caller_phone, "")
@@ -1583,6 +1639,18 @@ async def yemot_router(request: Request):
         idle_action = params.get("idle_action")
         msg_action = params.get("msg_action")
         action = params.get("action") or params.get("digits") or params.get("data") or params.get("key") or ""
+
+        if call_action is not None:
+            call_action = call_action.strip()
+        if idle_action is not None:
+            idle_action = idle_action.strip()
+
+        if call_id in manager.just_sent_to_9:
+            manager.just_sent_to_9.discard(call_id)
+            if call_action == "9":
+                call_action = None
+            if idle_action == "9":
+                idle_action = None
 
         # מצב דו-מערכתי: במערכת החדשה -> רישום ראשוני בשלוחה 9 + שיחה (כניסה/ניתוק/ניהול צינתוקים)
         if is_secondary_configured() and is_from_secondary:
@@ -1600,7 +1668,7 @@ async def yemot_router(request: Request):
                 waiting_call = get_waiting_call_for_agent(caller_phone)
 
             if call_action is not None:
-                root_logger.info(f"🔘 נציג {caller_phone} הקיש {call_action} בתפריט השיחה במערכת החדשה")
+                root_logger.info(f"🔘 נציג {caller_phone} הקיש [{call_action}] בתפריט השיחה במערכת החדשה")
                 if call_action == "1":
                     async with manager.lock:
                         selected_call = get_waiting_call_for_agent(caller_phone)
@@ -1609,32 +1677,34 @@ async def yemot_router(request: Request):
                             return Response(f"id_list_message=t-מעביר אותך לשיחה&go_to_folder={agent_dest}", media_type="text/plain; charset=utf-8")
                         else:
                             root_logger.info(f"ℹ️ נציג {caller_phone} אישר מענה אך השיחה כבר אינה ממתינה בתור.")
-                            return Response("id_list_message=t-השיחה כבר אינה ממתינה בתור&hangup=yes", media_type="text/plain; charset=utf-8")
+                            return Response("id_list_message=t-השיחה כבר אינה ממתינה בתור&go_to_folder=/1", media_type="text/plain; charset=utf-8")
                 elif call_action == "9":
+                    manager.just_sent_to_9.add(call_id)
                     dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=f"/{gateway_ext}")
                     root_logger.info(f"⚙️ נציג {caller_phone} עובר מהשיחה לניהול קבלת הצינתוקים -> {dest_9}")
                     return Response(f"go_to_folder={dest_9}", media_type="text/plain; charset=utf-8")
                 else:
-                    root_logger.info(f"📴 נציג {caller_phone} בחר לנתק מהשיחה במערכת החדשה.")
-                    return Response("hangup=yes", media_type="text/plain; charset=utf-8")
+                    root_logger.info(f"📴 נציג {caller_phone} בחר/המתין לניתוק מהשיחה במערכת החדשה -> שלוחה 1.")
+                    return Response("go_to_folder=/1", media_type="text/plain; charset=utf-8")
 
             if idle_action is not None:
                 root_logger.info(f"🔘 נציג {caller_phone} הקיש [{idle_action}] בתפריט ללא שיחות במערכת החדשה")
                 if idle_action == "9":
+                    manager.just_sent_to_9.add(call_id)
                     dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=f"/{gateway_ext}")
                     root_logger.info(f"⚙️ נציג {caller_phone} עובר לניהול קבלת הצינתוקים -> {dest_9}")
                     return Response(f"go_to_folder={dest_9}", media_type="text/plain; charset=utf-8")
                 else:
-                    root_logger.info(f"📴 נציג {caller_phone} בחר לנתק מהמערכת החדשה (אין שיחות ממתינות).")
-                    return Response("hangup=yes", media_type="text/plain; charset=utf-8")
+                    root_logger.info(f"📴 נציג {caller_phone} מועבר לשלוחת ניתוק (/1) (אין שיחות ממתינות).")
+                    return Response("go_to_folder=/1", media_type="text/plain; charset=utf-8")
 
             if waiting_call:
                 ident = format_caller_ident_for_tts(waiting_call)
                 root_logger.info(f"📢 מציג לנציג {caller_phone} במערכת החדשה: שיחה ממתינה מאת {ident}")
-                return Response(f"read=t-שיחה ממתינה מאת {ident} למעבר לשיחה הקישו אחת לניתוק הקישו שתיים לניהול קבלת הצינתוקים הקישו תשע=call_action,no,1,1,7,Digits", media_type="text/plain; charset=utf-8")
+                return Response(f"read=t-שיחה ממתינה מאת {ident} למעבר לשיחה הקישו אחת לניתוק הקישו שתיים לניהול קבלת הצינתוקים הקישו תשע=call_action,no,1,1,5,No,no,no,,,1,Ok,None", media_type="text/plain; charset=utf-8")
             else:
                 root_logger.info(f"ℹ️ נציג {caller_phone} נכנס לשלוחה 10 במערכת החדשה - אין שיחות ממתינות.")
-                return Response("read=t-אין שיחות ממתינות במערכת לניתוק השיחה הקש אחת או המתן לניהול קבלת השיחות הקש תשע=idle_action,no,1,1,5,Digits", media_type="text/plain; charset=utf-8")
+                return Response("read=t-אין שיחות ממתינות במערכת לניתוק השיחה הקישו אחת או המתינו לניהול קבלת השיחות הקישו תשע=idle_action,no,1,1,5,No,no,no,,,1,Ok,None", media_type="text/plain; charset=utf-8")
 
         # מצב דו-מערכתי: במערכת הישנה -> הודעות בלבד!
         if is_secondary_configured() and not is_from_secondary:
@@ -1676,7 +1746,7 @@ async def yemot_router(request: Request):
 
         # שלב א': אישור מענה לשיחה
         if call_action is not None:
-            root_logger.info(f"🔘 נציג {caller_phone} הקיש {call_action} בתפריט פרטי השיחה")
+            root_logger.info(f"🔘 נציג {caller_phone} הקיש [{call_action}] בתפריט פרטי השיחה")
             if call_action == "1":
                 async with manager.lock:
                     selected_call = get_waiting_call_for_agent(caller_phone)
@@ -1687,21 +1757,23 @@ async def yemot_router(request: Request):
                         root_logger.info(f"ℹ️ נציג {caller_phone} אישר מענה אך השיחה כבר אינה ממתינה בתור.")
                         return Response("id_list_message=t-השיחה כבר אינה ממתינה בתור&hangup=yes", media_type="text/plain; charset=utf-8")
             elif call_action == "9":
+                manager.just_sent_to_9.add(call_id)
                 dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=f"/{gateway_ext}")
                 root_logger.info(f"⚙️ נציג {caller_phone} עובר לניהול קבלת הצינתוקים -> {dest_9}")
                 return Response(f"go_to_folder={dest_9}", media_type="text/plain; charset=utf-8")
             else:
-                root_logger.info(f"📴 נציג {caller_phone} בחר לנתק מהשיחה.")
+                root_logger.info(f"📴 נציג {caller_phone} בחר/המתין לניתוק מהשיחה.")
                 return Response("hangup=yes", media_type="text/plain; charset=utf-8")
 
         if idle_action is not None:
             root_logger.info(f"🔘 נציג {caller_phone} הקיש [{idle_action}] בתפריט ללא שיחות")
             if idle_action == "9":
+                manager.just_sent_to_9.add(call_id)
                 dest_9 = await prepare_agent_tzintuk_folder(caller_phone, end_goto=f"/{gateway_ext}")
                 root_logger.info(f"⚙️ נציג {caller_phone} עובר לניהול קבלת הצינתוקים -> {dest_9}")
                 return Response(f"go_to_folder={dest_9}", media_type="text/plain; charset=utf-8")
             else:
-                root_logger.info(f"📴 נציג {caller_phone} בחר לנתק (אין שיחות ממתינות).")
+                root_logger.info(f"📴 נציג {caller_phone} בחר/המתין לניתוק (אין שיחות ממתינות).")
                 return Response("hangup=yes", media_type="text/plain; charset=utf-8")
 
         # שלב ב': שמיעת הודעה
@@ -1719,7 +1791,7 @@ async def yemot_router(request: Request):
             root_logger.info(f"🔘 נציג {caller_phone} הקיש {action} בתפריט המשולב (שיחה + הודעה)")
             if action == "1" and has_waiting_call:
                 ident = format_caller_ident_for_tts(waiting_call)
-                return Response(f"read=t-שיחה ממתינה מאת {ident} למעבר לשיחה הקישו אחת לניתוק הקישו שתיים לניהול קבלת הצינתוקים הקישו תשע=call_action,no,1,1,7,Digits", media_type="text/plain; charset=utf-8")
+                return Response(f"read=t-שיחה ממתינה מאת {ident} למעבר לשיחה הקישו אחת לניתוק הקישו שתיים לניהול קבלת הצינתוקים הקישו תשע=call_action,no,1,1,5,No,no,no,,,1,Ok,None", media_type="text/plain; charset=utf-8")
             elif action == "2" and has_new_msg:
                 asyncio.create_task(save_agent_last_heard_file(caller_phone, latest_wav))
                 return Response(f"id_list_message=t-מעביר אותך לשמיעת ההודעה&go_to_folder=/{msg_ext_full}", media_type="text/plain; charset=utf-8")
@@ -1733,13 +1805,13 @@ async def yemot_router(request: Request):
         elif has_waiting_call:
             ident = format_caller_ident_for_tts(waiting_call)
             root_logger.info(f"📢 מציג לנציג {caller_phone}: שיחה ממתינה מאת {ident}")
-            return Response(f"read=t-שיחה ממתינה מאת {ident} למעבר לשיחה הקישו אחת לניתוק הקישו שתיים לניהול קבלת הצינתוקים הקישו תשע=call_action,no,1,1,7,Digits", media_type="text/plain; charset=utf-8")
+            return Response(f"read=t-שיחה ממתינה מאת {ident} למעבר לשיחה הקישו אחת לניתוק הקישו שתיים לניהול קבלת הצינתוקים הקישו תשע=call_action,no,1,1,5,No,no,no,,,1,Ok,None", media_type="text/plain; charset=utf-8")
         elif has_new_msg:
             root_logger.info(f"📢 מציג לנציג {caller_phone}: קיימת הודעה חדשה.")
             return Response("read=t-קיימת הודעה חדשה לשמיעת ההודעה הקישו אחת לכניסה רגילה הקישו שתיים=msg_action,no,1,1,7,Digits", media_type="text/plain; charset=utf-8")
         else:
             root_logger.info(f"ℹ️ נציג {caller_phone} נכנס לשלוחה 10 - אין שיחות ממתינות.")
-            return Response("read=t-אין שיחות ממתינות במערכת לניתוק השיחה הקש אחת או המתן לניהול קבלת השיחות הקש תשע=idle_action,no,1,1,5,Digits", media_type="text/plain; charset=utf-8")
+            return Response("read=t-אין שיחות ממתינות במערכת לניתוק השיחה הקישו אחת או המתינו לניהול קבלת השיחות הקישו תשע=idle_action,no,1,1,5,No,no,no,,,1,Ok,None", media_type="text/plain; charset=utf-8")
 
     # ==============================================================
     # 4. שלוחה 30: השמעת פרטי השיחה בהקשה על 0
